@@ -48,10 +48,34 @@ def check_datagram(datagram):
             print("fragment_offset:", fragment_offset)
             print("total_chunk_size:", total_chunk_size)
             print("fragment bytes:", len(fragment_data))
+            return file_id, chunk_index, fragment_offset, total_chunk_size, fragment_data
     else:
         print("corruption in the payload")
 
 
+
+
+def reassemble_chunk(fragments):
+    fragments.sort(key=lambda part: part[2])  # sort by fragment_offset
+
+    total_size = fragments[0][3]
+    chunk = bytearray()
+    expected_offset = 0
+
+    for file_id, chunk_index, offset, part_total_size, data in fragments:
+        if part_total_size != total_size:
+            raise ValueError("Fragments disagree about total chunk size")
+        if offset != expected_offset:
+            raise ValueError("A fragment is missing or overlaps another")
+
+        chunk.extend(data)
+        expected_offset += len(data)
+
+    if expected_offset != total_size:
+        raise ValueError("Chunk is incomplete")
+
+    return bytes(chunk)
+     
 def get_packet_type(packet_name):
     packet_name = packet_name.upper()
 
