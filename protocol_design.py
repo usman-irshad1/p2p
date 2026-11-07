@@ -32,8 +32,22 @@ def check_datagram(datagram):
         elif packet_type == 0 or packet_type == 3 or packet_type == 4:
             print("No payload")  
 
-        else:
-            print("Payload parser not added for packet type", packet_type)
+
+        elif packet_type == 7:  # CHUNK_DATA
+            if len(payload) < 44:
+                raise ValueError("CHUNK_DATA payload is missing metadata")
+
+            file_id, chunk_index, fragment_offset, total_chunk_size = struct.unpack( "!32sIII", payload[:44])
+            fragment_data = payload[44:]
+
+            if fragment_offset + len(fragment_data) > total_chunk_size:
+                raise ValueError("Fragment extends beyond the chunk")
+
+            print("file_id:", file_id.hex())
+            print("chunk_index:", chunk_index)
+            print("fragment_offset:", fragment_offset)
+            print("total_chunk_size:", total_chunk_size)
+            print("fragment bytes:", len(fragment_data))
     else:
         print("corruption in the payload")
 
@@ -92,6 +106,28 @@ def make_payload(payload, packet_type):
             raise ValueError("file_id must be a 32-byte SHA-256 hash")
 
         return file_id + struct.pack("!I", chunk_index)
+
+    elif packet_type == 7:  # CHUNK_DATA
+        file_id, chunk_index, fragment_offset, total_chunk_size, fragment_data = payload
+
+        if len(file_id) != 32:
+            raise ValueError("file_id must be 32 bytes")
+
+        if not isinstance(fragment_data, bytes):
+          raise ValueError("fragment_data must be bytes")
+
+        if fragment_offset + len(fragment_data) > total_chunk_size:
+          raise ValueError("Fragment extends beyond the chunk")
+
+        metadata = struct.pack(
+          "!32sIII",
+         file_id,
+         chunk_index,
+         fragment_offset,
+         total_chunk_size,
+        )
+
+        return metadata + fragment_data
 
     elif packet_type == 9:
         file_id, chunk_index = payload
@@ -229,6 +265,7 @@ def make_datagram(packet_name, peer_id, destination_p_id, protocol_version,flags
             return data_frame
 
     if (packet_type==7):# for chuck data
+            
             fields = (
             peer_id,          # source peer ID
             destination_p_id,          # destination peer ID
@@ -307,6 +344,15 @@ chunk_index = 3
 
 packet = make_datagram(
     packet_name="CHUNK_REQUEST", peer_id=1001, destination_p_id=1002, protocol_version=1, flags=0, group_id=0, seq_no=8, ack_no=0, payload=(file_id, chunk_index), checksum=0,)
+
+print("Datagram bytes:", packet)
+check_datagram(packet)
+
+file_id = b"\x01" * 32
+packet = make_datagram(
+    packet_name="CHUNK_DATA", peer_id=1001, destination_p_id=1002,
+    protocol_version=1, flags=0, group_id=0, seq_no=9, ack_no=0,
+    payload=(file_id, 3, 0, 1000, b"A" * 500), checksum=0)
 
 print("Datagram bytes:", packet)
 check_datagram(packet)
