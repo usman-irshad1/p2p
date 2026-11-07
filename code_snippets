@@ -1,0 +1,42 @@
+    
+    
+
+
+
+
+    
+
+
+
+#decoded_fields = struct.unpack(HEADER_FORMAT, header_bytes)
+#total= header_bytes+payload
+
+#print(total)
+#extracted_payload_bytes=total[header_size:]
+#actual_payload_length = len(extracted_payload_bytes)
+#message_delvered=total[header_size:].decode("utf-8")
+#if (actual_payload_length== decoded_fields[8]):
+#    print(struct.unpack(HEADER_FORMAT,total[:header_size]))
+#    print("Header size:", len(header_bytes))
+#   print("Decoded fields:", decoded_fields)
+#    print("Round trip successful:", decoded_fields == fields)
+#    print(message_delvered)
+#else:
+#    print("corruption in the payload")
+
+
+#payload = "hello" 
+#payload=payload.encode("utf-8")
+#fields = (
+#    1001,          # source peer ID
+#    1002,          # destination peer ID
+#    1,             # packet type, e.g. JOIN
+#    1,             # protocol version
+#    0,             # flags
+#    0,             # group ID
+#    0,             # sequence number
+#    0,             # acknowledgment number
+#    len(payload),  # payload length
+#    0,             # checksum (not calculated yet)
+#)
+#header_bytes = struct.pack(HEADER_FORMAT, *fields)
