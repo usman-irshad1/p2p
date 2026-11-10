@@ -8,18 +8,6 @@ import time
 messages = queue.Queue()
 peers = []
 
-local_port = int(sys.argv[1])
-bootstrap_addr = None
-
-if len(sys.argv) > 2:
-    host, port = sys.argv[2].rsplit(":", 1)
-    bootstrap_addr = (host, int(port))
-
-
-advertise_ip = "127.0.0.1"
-server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-server.bind(("0.0.0.0", local_port))
-
 
 def receive():
     while True:
@@ -41,7 +29,8 @@ def join_ack(joiner_addr, joining_id):
         if known_id != joining_id:
             entries.append((known_id, known_addr[0], known_addr[1]))
 
-    peer_list_text = ";".join( f"{known_id},{ip},{port}"
+    peer_list_text = ";".join(
+        f"{known_id},{ip},{port}"
         for known_id, ip, port in entries
     )
 
@@ -68,10 +57,8 @@ def broadcast():
                 if not any(known_id == joining_id for known_id, _ in peers):
                     peers.append((joining_id, addr))
 
-                
                 join_ack(addr, joining_id)
 
-                
                 outgoing = f"{joining_id} joined".encode("utf-8")
 
                 for peer in peers:
@@ -101,17 +88,37 @@ def broadcast():
             messages.task_done()
 
 
-peer_id = id_generation()
+def main():
+    global server, local_port, bootstrap_addr
+    global advertise_ip, peer_id
 
-threading.Thread(target=receive, daemon=True).start()
-threading.Thread(target=broadcast, daemon=True).start()
+    local_port = int(sys.argv[1])
+    bootstrap_addr = None
 
-if bootstrap_addr is not None:
-    join(peer_id, bootstrap_addr)
-else:
-    print("Started as the first peer")
+    if len(sys.argv) > 2:
+        host, port = sys.argv[2].rsplit(":", 1)
+        bootstrap_addr = (host, int(port))
 
-print("Peer is running on port", local_port)
+    advertise_ip = "127.0.0.1"
 
-while True:
-    time.sleep(1)
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.bind(("0.0.0.0", local_port))
+
+    peer_id = id_generation()
+
+    threading.Thread(target=receive, daemon=True).start()
+    threading.Thread(target=broadcast, daemon=True).start()
+
+    if bootstrap_addr is not None:
+        join(peer_id, bootstrap_addr)
+    else:
+        print("Started as the first peer")
+
+    print("Peer is running on port", local_port)
+
+    while True:
+        time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()
