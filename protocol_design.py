@@ -359,24 +359,47 @@ def make_datagram(packet_name, peer_id, destination_p_id, protocol_version,flags
             return data_frame
 
 
+def main():
+    file_id = b"\x01" * 32
+    chunk_index = 3
+
+    # A pretend 1000-byte chunk
+    original_chunk = b"A" * 500 + b"B" * 500
+    fragments = []
+
+    # Make two 500-byte CHUNK_DATA packets
+    for offset in (0, 500):
+        fragment_data = original_chunk[offset:offset + 500]
+
+        packet = make_datagram(
+            packet_name="CHUNK_DATA",
+            peer_id=1001,
+            destination_p_id=1002,
+            protocol_version=1,
+            flags=0,
+            group_id=0,
+            seq_no=offset // 500,
+            ack_no=0,
+            payload=(
+                file_id,
+                chunk_index,
+                offset,
+                len(original_chunk),
+                fragment_data,
+            ),
+            checksum=0,
+        )
+
+        fragment_info = check_datagram(packet)
+        if fragment_info is not None:
+            fragments.append(fragment_info)
+
+    rebuilt_chunk = reassemble_chunk(fragments)
+
+    print("Fragments collected:", len(fragments))
+    print("Rebuilt size:", len(rebuilt_chunk))
+    print("Matches original:", rebuilt_chunk == original_chunk)
 
 
-
-
-file_id = b"\x01" * 32  # placeholder for a quick format test
-chunk_index = 3
-
-packet = make_datagram(
-    packet_name="CHUNK_REQUEST", peer_id=1001, destination_p_id=1002, protocol_version=1, flags=0, group_id=0, seq_no=8, ack_no=0, payload=(file_id, chunk_index), checksum=0,)
-
-print("Datagram bytes:", packet)
-check_datagram(packet)
-
-file_id = b"\x01" * 32
-packet = make_datagram(
-    packet_name="CHUNK_DATA", peer_id=1001, destination_p_id=1002,
-    protocol_version=1, flags=0, group_id=0, seq_no=9, ack_no=0,
-    payload=(file_id, 3, 0, 1000, b"A" * 500), checksum=0)
-
-print("Datagram bytes:", packet)
-check_datagram(packet)
+if __name__ == "__main__":
+    main()
