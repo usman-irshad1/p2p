@@ -39,7 +39,7 @@ def join_ack(joiner_addr, joining_id):
 
 
 def join(peer_id, bootstrap_addr):
-    message = f"join:{peer_id}".encode("utf-8")
+    message = f"join:{peer_id}".encode("utf-8") 
     server.sendto(message, bootstrap_addr)
 
 
@@ -59,11 +59,11 @@ def broadcast():
 
                 join_ack(addr, joining_id)
 
-                outgoing = f"{joining_id} joined".encode("utf-8")
+                outgoing = (f"new_peer:{joining_id},{addr[0]},{addr[1]}").encode("utf-8")
 
-                for peer in peers:
-                    if peer[1] != addr:
-                        server.sendto(outgoing, peer[1])
+                for known_id, known_addr in peers:
+                    if known_id != joining_id:
+                        server.sendto(outgoing, known_addr)
 
             elif text.startswith("join_ack:"):
                 peer_list_text = text.split(":", 1)[1]
@@ -79,6 +79,21 @@ def broadcast():
                             for existing_id, _ in peers
                         ):
                             peers.append((known_id, known_addr))
+
+                print("Updated peer list:", peers)
+
+            elif text.startswith("new_peer:"):
+                peer_info = text.split(":", 1)[1]
+                known_id_text, known_ip, known_port_text = peer_info.split(",")
+
+                known_id = int(known_id_text)
+                known_addr = (known_ip, int(known_port_text))
+
+                if known_id != peer_id and not any(
+                    existing_id == known_id
+                    for existing_id, _ in peers
+                    ):
+                    peers.append((known_id, known_addr))
 
                 print("Updated peer list:", peers)
 
