@@ -7,7 +7,10 @@ import time
 
 messages = queue.Queue()
 peers = []
+last_seen={} #this is a dictionary
 
+HEARTBEAT_INTERVAL = 5
+PEER_TIMEOUT = 15
 
 def receive():
     while True:
@@ -42,6 +45,12 @@ def join(peer_id, bootstrap_addr):
     message = f"join:{peer_id}".encode("utf-8") 
     server.sendto(message, bootstrap_addr)
 
+def heartbeat():
+    for peerid , peer_addr in peers:
+        message = f"heartbeat:{peer_id}".encode("utf-8")
+        server.sendto(message,peer_addr)
+    time.sleep(5)
+
 
 def broadcast():
     while True:
@@ -56,6 +65,8 @@ def broadcast():
 
                 if not any(known_id == joining_id for known_id, _ in peers):
                     peers.append((joining_id, addr))
+                    peers.append((joining_id, addr))
+                    last_seen[joining_id] = time.monotonic()
 
                 join_ack(addr, joining_id)
 
@@ -79,6 +90,8 @@ def broadcast():
                             for existing_id, _ in peers
                         ):
                             peers.append((known_id, known_addr))
+                            peers.append((joining_id, addr))
+                            last_seen[joining_id] = time.monotonic()
 
                 print("Updated peer list:", peers)
 
@@ -94,8 +107,19 @@ def broadcast():
                     for existing_id, _ in peers
                     ):
                     peers.append((known_id, known_addr))
+                    peers.append((joining_id, addr))
+                    last_seen[joining_id] = time.monotonic()
 
                 print("Updated peer list:", peers)
+
+            elif text.startswith("heartbeat:"):
+                sender_id = int(text.split(":", 1)[1])
+
+                for known_id, known_addr in peers:
+                    if known_id == sender_id and known_addr == addr:
+                        last_seen[sender_id] = time.monotonic()
+                        break
+
 
         except UnicodeDecodeError:
             print(f"Ignoring invalid message from {addr}")
@@ -122,6 +146,7 @@ def main():
     peer_id = id_generation()
 
     threading.Thread(target=receive, daemon=True).start()
+    threading.Thread(target=heartbeat, daemon=True).start()
     threading.Thread(target=broadcast, daemon=True).start()
 
     if bootstrap_addr is not None:
