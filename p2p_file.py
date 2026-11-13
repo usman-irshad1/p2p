@@ -7,10 +7,11 @@ import time
 
 messages = queue.Queue()
 peers = []
-last_seen={} #this is a dictionary
+last_seen = {}
 
 HEARTBEAT_INTERVAL = 5
 PEER_TIMEOUT = 15
+
 
 def receive():
     while True:
@@ -42,15 +43,36 @@ def join_ack(joiner_addr, joining_id):
 
 
 def join(peer_id, bootstrap_addr):
-    message = f"join:{peer_id}".encode("utf-8") 
+    message = f"join:{peer_id}".encode("utf-8")
     server.sendto(message, bootstrap_addr)
 
+
 def heartbeat():
-    while(True):
-        for peerid , peer_addr in peers:
-            message = f"heartbeat:{peer_id}".encode("utf-8")
-            server.sendto(message,peer_addr)
-        time.sleep(5)
+    while True:
+        message = f"heartbeat:{peer_id}".encode("utf-8")
+
+        for known_id, peer_addr in peers.copy():
+            server.sendto(message, peer_addr)
+
+        now = time.monotonic()
+
+        expired_ids = [
+            known_id
+            for known_id, peer_addr in peers.copy()
+            if known_id in last_seen
+            and now - last_seen[known_id] > PEER_TIMEOUT
+        ]
+
+        for expired_id in expired_ids:
+            peers[:] = [
+                (known_id, peer_addr)
+                for known_id, peer_addr in peers
+                if known_id != expired_id
+            ]
+            last_seen.pop(expired_id, None)
+            print(f"Peer {expired_id} timed out and was removed")
+
+        time.sleep(HEARTBEAT_INTERVAL)
 
 
 def broadcast():
@@ -70,7 +92,9 @@ def broadcast():
 
                 join_ack(addr, joining_id)
 
-                outgoing = (f"new_peer:{joining_id},{addr[0]},{addr[1]}").encode("utf-8")
+                outgoing = (
+                    f"new_peer:{joining_id},{addr[0]},{addr[1]}"
+                ).encode("utf-8")
 
                 for known_id, known_addr in peers:
                     if known_id != joining_id:
@@ -104,7 +128,7 @@ def broadcast():
                 if known_id != peer_id and not any(
                     existing_id == known_id
                     for existing_id, _ in peers
-                    ):
+                ):
                     peers.append((known_id, known_addr))
                     last_seen[known_id] = time.monotonic()
 
@@ -112,7 +136,11 @@ def broadcast():
 
             elif text.startswith("heartbeat:"):
                 sender_id = int(text.split(":", 1)[1])
-                
+
+                for known_id, known_addr in peers:
+                    if known_id == sender_id and known_addr == addr:
+                        last_seen[sender_id] = time.monotonic()
+                        break
 
         except UnicodeDecodeError:
             print(f"Ignoring invalid message from {addr}")
@@ -139,8 +167,8 @@ def main():
     peer_id = id_generation()
 
     threading.Thread(target=receive, daemon=True).start()
-    threading.Thread(target=heartbeat, daemon=True).start()
     threading.Thread(target=broadcast, daemon=True).start()
+    threading.Thread(target=heartbeat, daemon=True).start()
 
     if bootstrap_addr is not None:
         join(peer_id, bootstrap_addr)
