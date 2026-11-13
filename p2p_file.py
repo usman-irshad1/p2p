@@ -47,6 +47,12 @@ def join(peer_id, bootstrap_addr):
     server.sendto(message, bootstrap_addr)
 
 
+def leave(peer_id):
+    message = f"leave:{peer_id}".encode("utf-8") #this to notify every peer that the peer is leavig so that they can remove the peer from their peer list
+    for known_id, peer_addr in peers.copy():
+        server.sendto(message, peer_addr)
+
+
 def heartbeat():
     while True:
         message = f"heartbeat:{peer_id}".encode("utf-8")
@@ -142,6 +148,17 @@ def broadcast():
                         last_seen[sender_id] = time.monotonic()
                         break
 
+
+            elif text.startswith("leave:"):
+                leaving_id=int(text.split(":", 1)[1])
+                for known_id, known_addr in peers.copy():
+                    if known_id == leaving_id and known_addr == addr:
+                        peers.remove((known_id, known_addr))
+                        last_seen.pop(leaving_id, None)
+                        break
+
+                print("Updated peer list:", peers)
+
         except UnicodeDecodeError:
             print(f"Ignoring invalid message from {addr}")
         finally:
@@ -177,9 +194,11 @@ def main():
 
     print("Peer is running on port", local_port)
 
-    while True:
-        time.sleep(1)
-
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        leave(peer_id)
 
 if __name__ == "__main__":
     main()
