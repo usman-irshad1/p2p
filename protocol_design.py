@@ -31,7 +31,15 @@ def check_datagram(datagram):
                 print("The packet length is invalid")
 
         elif packet_type == 0 or packet_type == 3 or packet_type == 4:
-            print("No payload")  
+            print("No payload") 
+
+        elif packet_type == 5: 
+                    if (len(payload)==0):
+                        ack_sequce_number=decoded_fields[7]
+                        print(ack_sequce_number)   
+                    else:
+                        print("The packet is invalid")
+           
 
 
         elif packet_type == 7:  # CHUNK_DATA
@@ -186,7 +194,7 @@ def make_payload(payload, packet_type):
      
 
 
-def make_datagram(packet_name, peer_id, destination_p_id, protocol_version,flags,group_id,seq_no, ack_no, payload, checksum):
+def make_datagram(packet_name, peer_id, destination_p_id, protocol_version,flags,group_id,seq_no, payload, checksum,ack_no=None):
     packet_type = get_packet_type(packet_name)
     
     payload_encoded = make_payload(payload,packet_type)
@@ -276,6 +284,8 @@ def make_datagram(packet_name, peer_id, destination_p_id, protocol_version,flags
             return data_frame
 
     if (packet_type==5):# for ack
+            if ack_no is None:
+                raise ValueError("ACK requires the sequence number being acknowledged")
             fields = (
             peer_id,          # source peer ID
             destination_p_id,          # destination peer ID
@@ -285,14 +295,16 @@ def make_datagram(packet_name, peer_id, destination_p_id, protocol_version,flags
             group_id,             # group ID
             seq_no,             # sequence number
             ack_no,             # acknowledgment number
-            len(payload_encoded),  # payload length
+            0,  # payload length
             checksum,             # checksum (not calculated yet)
         )
             header_bytes = struct.pack(HEADER_FORMAT, *fields)
-            data_frame=header_bytes+payload_encoded
+            data_frame=header_bytes
             return data_frame
 
     if (packet_type==6):# for join ack
+            if ack_no is None:
+                raise ValueError("JOIN_ACK requires the JOIN sequence number")
             fields = (
             peer_id,          # source peer ID
             destination_p_id,          # destination peer ID
@@ -378,6 +390,10 @@ def make_datagram(packet_name, peer_id, destination_p_id, protocol_version,flags
             header_bytes = struct.pack(HEADER_FORMAT, *fields)
             data_frame=header_bytes+payload_encoded
             return data_frame
+
+
+
+
 
 
 def main():
