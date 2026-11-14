@@ -20,8 +20,8 @@ A student project to build a multi-peer group chat and file-sharing application 
 
 ### Still to implement or integrate
 
-- [ ] **Sync the tested heartbeat timeout implementation to GitHub.** The current pushed `p2p_file.py` sends heartbeats and parses their IDs, but does not update `last_seen` on heartbeat receipt or remove timed-out peers. Local screenshots show the timeout behavior, so commit and push that tested version.
-- [ ] Add a graceful LEAVE message and remove the leaving peer immediately.
+- [x] Heartbeat tracking and timeout removal are now present in the pushed `p2p_file.py`; the three-peer localhost screenshots show a silent peer being removed after its timeout.
+- [x] Add a graceful LEAVE message; recipients remove the leaving peer immediately. The three-peer localhost screenshots show the peer list updating after LEAVE.
 - [ ] Integrate the binary packet header and packet type handling from `protocol_design.py` into the live UDP peer program. Peer discovery currently uses text messages.
 - [ ] Implement reliable group chat over UDP: per-peer/directional sequence tracking, acknowledgments, retransmission, duplicate suppression, and in-order delivery.
 - [ ] Implement a real file catalog and chunk ownership announcements.
@@ -50,6 +50,79 @@ python p2p_file.py 5002 127.0.0.1:5000
 ```
 
 These commands are for testing multiple peers on one computer. The code's advertised address is currently `127.0.0.1`; peers on separate computers need a reachable LAN address instead.
+
+## Workflows
+
+### Current peer membership workflow
+
+The current `p2p_file.py` membership messages are text-based. A newcomer contacts one bootstrap peer, then that peer shares the newcomer's endpoint with its existing peers.
+
+```mermaid
+flowchart TD
+    A[Start peer and bind UDP port] --> B{Bootstrap address provided?}
+    B -- No --> C[Start as first peer]
+    B -- Yes --> D[Send JOIN to bootstrap]
+    D --> E[Bootstrap records newcomer]
+    E --> F[Bootstrap sends JOIN_ACK peer list to newcomer]
+    E --> G[Bootstrap sends NEW_PEER notice to existing peers]
+    F --> H[Newcomer adds listed peers]
+    G --> I[Existing peers add newcomer]
+    H --> J[Peers exchange heartbeats]
+    I --> J
+    J --> K{Heartbeat timeout or LEAVE?}
+    K -- Timeout --> L[Remove silent peer]
+    K -- LEAVE --> M[Remove leaving peer]
+```
+
+### Planned reliable chat workflow
+
+The flow below describes the intended binary protocol behavior. Reliable, ordered chat is not integrated into the live peer program yet.
+
+```mermaid
+sequenceDiagram
+    participant S as Sending peer
+    participant R as Receiving peer
+    S->>R: CHAT with packet sequence and chat sequence
+    R->>R: Check duplicate and ordering
+    R-->>S: ACK with the exact packet sequence
+    R->>R: Deliver chat text once in order
+    Note over S,R: On ACK timeout, sender retransmits; receiver deduplicates.
+```
+
+### Planned file download workflow
+
+```mermaid
+flowchart LR
+    A[Requester selects file] --> B[Find peers that have chunks]
+    B --> C[Send CHUNK_REQUEST]
+    C --> D[Peer sends CHUNK_DATA fragments]
+    D --> E[Check fragment metadata and offsets]
+    E --> F[Reassemble each chunk]
+    F --> G[Reassemble file and verify SHA-256]
+    H[Source peer fails] --> I[Request missing chunk from another replica]
+    I --> D
+```
+
+## Graphs
+
+These are configuration and local-demo values, not performance benchmarks.
+
+Heartbeat settings in the current peer program (each `#` represents one second):
+
+```text
+Heartbeat interval  #####               5 seconds
+Peer timeout        ###############    15 seconds
+```
+
+Local CHUNK_DATA reassembly demo sizes:
+
+```text
+Fragment 1          ##########          500 bytes
+Fragment 2          ##########          500 bytes
+Reassembled chunk   #################### 1,000 bytes
+```
+
+Measured performance graphs still need real test data. Planned graphs include chat delivery latency vs. peer count, file throughput vs. file size, and recovery time after a chunk source is stopped during a download.
 
 ## Current limitations
 

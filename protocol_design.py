@@ -1,6 +1,7 @@
 import struct
 import hashlib
 HEADER_FORMAT = "!HHBBHIHHHH"
+import socket
 header_size=struct.calcsize(HEADER_FORMAT)
 print(struct.calcsize(HEADER_FORMAT))
 
@@ -101,6 +102,8 @@ def get_packet_type(packet_name):
         return 9
     elif packet_name == "REPLICATE_REQ":
         return 10
+    elif packet_name == "NEW PEER":
+        return 11
     else:
         raise ValueError("Unknown packet type")
 
@@ -130,6 +133,24 @@ def make_payload(payload, packet_type):
             raise ValueError("file_id must be a 32-byte SHA-256 hash")
 
         return file_id + struct.pack("!I", chunk_index)
+
+    elif packet_type == 5:  # ACK
+        return b""
+
+    elif packet_type == 6:  # JOIN_ACK
+        peer_list = payload
+        payload_bytes = struct.pack("!H", len(peer_list))
+
+        for known_id, ip, port in peer_list:  # this is for the peer list to be shared to other peers when a new peer joins
+            peer_record = struct.pack(
+                "!H4sH",
+                known_id,
+                socket.inet_aton(ip),
+                port,
+            )
+            payload_bytes += peer_record
+
+        return payload_bytes
 
     elif packet_type == 7:  # CHUNK_DATA
         file_id, chunk_index, fragment_offset, total_chunk_size, fragment_data = payload
