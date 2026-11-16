@@ -4,13 +4,51 @@ import socket
 
 HEADER_FORMAT = "!HHBBHIHHHH"
 header_size = struct.calcsize(HEADER_FORMAT)
-print(header_size)
+CHECKSUM_OFFSET = header_size - 2
+
+
+def checksum(data):
+    """Return the RFC 1071 Internet checksum of bytes in network order."""
+    if len(data) % 2:
+        data = data + b"\x00"
+
+    total = 0
+    for index in range(0, len(data), 2):
+        total += (data[index] << 8) | data[index + 1]
+
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+
+    return (~total) & 0xFFFF
+
+
+def compute_checksum(datagram):
+    """Cover the application header and payload with the checksum field zeroed.
+
+    No IP/UDP pseudo-header is included. Odd-length padding is used only for
+    calculation and is never transmitted.
+    """
+    if len(datagram) < header_size:
+        raise ValueError("Datagram is shorter than the header")
+
+    zeroed = (datagram[:CHECKSUM_OFFSET] + b"\x00\x00"
+              + datagram[CHECKSUM_OFFSET + 2:])
+    return checksum(zeroed)
+
+
+def _with_checksum(datagram):
+    value = compute_checksum(datagram)
+    return (datagram[:CHECKSUM_OFFSET] + struct.pack("!H", value)
+            + datagram[CHECKSUM_OFFSET + 2:])
 
 def check_datagram(datagram):
     if len(datagram) < header_size:
         raise ValueError("Datagram is shorter than the header")
 
     decoded_fields = struct.unpack(HEADER_FORMAT, datagram[:header_size])
+    if compute_checksum(datagram) != decoded_fields[9]:
+        raise ValueError("Checksum mismatch")
+
     actual_payload_length = len(datagram[header_size:])
     packet_type = decoded_fields[2]
     payload = datagram[header_size:]
@@ -365,9 +403,14 @@ def make_datagram(
     group_id,
     seq_no,
     payload,
-    checksum,
+    checksum=0,
     ack_no=None,
 ):
+    """Build a datagram and calculate its checksum automatically.
+
+    The legacy checksum argument is accepted for existing callers but ignored;
+    the checksum always reflects the final header and payload bytes.
+    """
     packet_type = get_packet_type(packet_name)
     payload_encoded = make_payload(payload, packet_type)
 
@@ -385,7 +428,7 @@ def make_datagram(
             checksum,
         )
         header_bytes = struct.pack(HEADER_FORMAT, *fields)
-        return header_bytes
+        return _with_checksum(header_bytes)
 
     if packet_type == 1:  # CHAT
         fields = (
@@ -401,7 +444,7 @@ def make_datagram(
             checksum,
         )
         header_bytes = struct.pack(HEADER_FORMAT, *fields)
-        return header_bytes + payload_encoded
+        return _with_checksum(header_bytes + payload_encoded)
 
     if packet_type == 2:  # CHUNK_REQUEST
         fields = (
@@ -417,7 +460,7 @@ def make_datagram(
             checksum,
         )
         header_bytes = struct.pack(HEADER_FORMAT, *fields)
-        return header_bytes + payload_encoded
+        return _with_checksum(header_bytes + payload_encoded)
 
     if packet_type == 3:  # LEAVE
         fields = (
@@ -433,7 +476,7 @@ def make_datagram(
             checksum,
         )
         header_bytes = struct.pack(HEADER_FORMAT, *fields)
-        return header_bytes + payload_encoded
+        return _with_checksum(header_bytes + payload_encoded)
 
     if packet_type == 4:  # HEARTBEAT
         fields = (
@@ -449,7 +492,7 @@ def make_datagram(
             checksum,
         )
         header_bytes = struct.pack(HEADER_FORMAT, *fields)
-        return header_bytes + payload_encoded
+        return _with_checksum(header_bytes + payload_encoded)
 
     if packet_type == 5:  # ACK
         if ack_no is None:
@@ -469,7 +512,7 @@ def make_datagram(
             0,
             checksum,
         )
-        return struct.pack(HEADER_FORMAT, *fields)
+        return _with_checksum(struct.pack(HEADER_FORMAT, *fields))
 
     if packet_type == 6:  # JOIN_ACK
         if ack_no is None:
@@ -488,7 +531,7 @@ def make_datagram(
             checksum,
         )
         header_bytes = struct.pack(HEADER_FORMAT, *fields)
-        return header_bytes + payload_encoded
+        return _with_checksum(header_bytes + payload_encoded)
 
     if packet_type == 7:  # CHUNK_DATA
         fields = (
@@ -504,7 +547,7 @@ def make_datagram(
             checksum,
         )
         header_bytes = struct.pack(HEADER_FORMAT, *fields)
-        return header_bytes + payload_encoded
+        return _with_checksum(header_bytes + payload_encoded)
 
     if packet_type == 8:  # FILE_LIST
         fields = (
@@ -520,7 +563,7 @@ def make_datagram(
             checksum,
         )
         header_bytes = struct.pack(HEADER_FORMAT, *fields)
-        return header_bytes + payload_encoded
+        return _with_checksum(header_bytes + payload_encoded)
 
     if packet_type == 9:  # CHUNK_HAVE
         fields = (
@@ -536,7 +579,7 @@ def make_datagram(
             checksum,
         )
         header_bytes = struct.pack(HEADER_FORMAT, *fields)
-        return header_bytes + payload_encoded
+        return _with_checksum(header_bytes + payload_encoded)
 
     if packet_type == 10:  # REPLICATE_REQ
         fields = (
@@ -552,7 +595,7 @@ def make_datagram(
             checksum,
         )
         header_bytes = struct.pack(HEADER_FORMAT, *fields)
-        return header_bytes + payload_encoded
+        return _with_checksum(header_bytes + payload_encoded)
 
     if packet_type == 11:  # NEW_PEER
         fields = (
@@ -568,10 +611,108 @@ def make_datagram(
             checksum,
         )
         header_bytes = struct.pack(HEADER_FORMAT, *fields)
-        return header_bytes + payload_encoded
+        return _with_checksum(header_bytes + payload_encoded)
+
+
+
+def run_checksum_tests():
+    """Run checksum regression tests alongside the existing packet demos."""
+    import contextlib
+    import io
+    import unittest
+
+    class ChecksumTests(unittest.TestCase):
+        def packet(self, name="CHAT", payload=(1, "hello"), **overrides):
+            fields = dict(packet_name=name, peer_id=1001,
+                          destination_p_id=1002, protocol_version=1, flags=0,
+                          group_id=0, seq_no=1, ack_no=0, payload=payload)
+            fields.update(overrides)
+            return make_datagram(**fields)
+
+        def test_known_vectors(self):
+            # RFC 1071 section 3 example: sum DDF2, complement 220D.
+            self.assertEqual(checksum(bytes.fromhex("0001f203f4f5f6f7")), 0x220D)
+            self.assertEqual(checksum(b""), 0xFFFF)
+            self.assertEqual(checksum(b"\x01"), 0xFEFF)
+            self.assertEqual(checksum(b"\xff" * 5), 0x00FF)
+            self.assertEqual(checksum(b"\xff\xff"), 0)
+
+        def test_all_packet_types(self):
+            cases = [
+                ("JOIN", None), ("CHAT", (1, "hello")),
+                ("CHUNK_REQUEST", (b"a" * 32, 2)), ("LEAVE", None),
+                ("HEARTBEAT", None), ("ACK", None),
+                ("JOIN_ACK", [(1003, "127.0.0.1", 5000)]),
+                ("CHUNK_DATA", (b"a" * 32, 2, 0, 3, b"abc")),
+                ("FILE_LIST", [(b"a" * 32, 3, 3, "a.txt")]),
+                ("CHUNK_HAVE", (b"a" * 32, 2)),
+                ("REPLICATE_REQ", (b"a" * 32, 2)),
+                ("NEW_PEER", (1003, "127.0.0.1", 5000)),
+            ]
+            for name, payload in cases:
+                with self.subTest(packet=name):
+                    packet = self.packet(name, payload)
+                    stored = struct.unpack_from("!H", packet, CHECKSUM_OFFSET)[0]
+                    self.assertEqual(stored, compute_checksum(packet))
+                    self.assertEqual(checksum(packet), 0)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        check_datagram(packet)
+
+        def test_odd_and_even_payloads(self):
+            for text in ("ab", "abc", "", "سلام"):
+                with self.subTest(text=text):
+                    packet = self.packet(payload=(1, text))
+                    self.assertEqual(len(packet), header_size + 4 + len(text.encode()))
+                    self.assertEqual(checksum(packet), 0)
+
+        def test_header_corruption_rejected(self):
+            packet = bytearray(self.packet())
+            packet[0] ^= 1
+            with self.assertRaisesRegex(ValueError, "Checksum mismatch"):
+                check_datagram(bytes(packet))
+
+        def test_payload_corruption_rejected(self):
+            packet = bytearray(self.packet())
+            packet[-1] ^= 1
+            with self.assertRaisesRegex(ValueError, "Checksum mismatch"):
+                check_datagram(bytes(packet))
+
+        def test_checksum_corruption_rejected(self):
+            packet = bytearray(self.packet())
+            packet[CHECKSUM_OFFSET] ^= 1
+            with self.assertRaisesRegex(ValueError, "Checksum mismatch"):
+                check_datagram(bytes(packet))
+
+        def test_short_datagrams_rejected(self):
+            for length in (0, 1, header_size - 1):
+                for function in (compute_checksum, check_datagram):
+                    with self.subTest(length=length, function=function.__name__):
+                        with self.assertRaisesRegex(ValueError, "shorter than the header"):
+                            function(bytes(length))
+
+        def test_existing_checksum_is_zeroed(self):
+            packet = self.packet()
+            modified = packet[:CHECKSUM_OFFSET] + b"\x12\x34" + packet[header_size:]
+            self.assertEqual(compute_checksum(packet), compute_checksum(modified))
+            self.assertEqual(self.packet(checksum=1234), packet)
+
+        def test_zero_checksum_is_valid(self):
+            # Header word sum before checksum is FFFF, so its complement is zero.
+            packet = self.packet("JOIN", None, peer_id=0xFFFE,
+                                 destination_p_id=0, seq_no=0)
+            self.assertEqual(packet[CHECKSUM_OFFSET:header_size], b"\x00\x00")
+            with contextlib.redirect_stdout(io.StringIO()):
+                check_datagram(packet)
+
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(ChecksumTests)
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    if not result.wasSuccessful():
+        raise SystemExit(1)
 
 
 def main():
+    run_checksum_tests()
+
     # Test ACK.
     ack_packet = make_datagram(
         packet_name="ACK",
