@@ -772,6 +772,47 @@ def main():
 
     print("Checksum tests passed.")
 
+        # Test CHUNK_DATA fragmentation and reassembly.
+    print("\nTesting CHUNK_DATA reassembly:")
+
+    file_id = b"\x01" * 32
+    chunk_index = 3
+    original_chunk = b"A" * 500 + b"B" * 500
+    fragments = []
+
+    # Send the 1,000-byte chunk as two 500-byte fragments.
+    for fragment_offset in (0, 500):
+        fragment_data = original_chunk[
+            fragment_offset:fragment_offset + 500
+        ]
+
+        packet = make_datagram(
+            packet_name="CHUNK_DATA",
+            peer_id=1001,
+            destination_p_id=1002,
+            protocol_version=1,
+            flags=0,
+            group_id=0,
+            seq_no=fragment_offset // 500,
+            ack_no=0,
+            payload=(
+                file_id,
+                chunk_index,
+                fragment_offset,
+                len(original_chunk),
+                fragment_data,
+            ),
+        )
+
+        fragment = check_datagram(packet)
+        fragments.append(fragment)
+
+    rebuilt_chunk = reassemble_chunk(fragments)
+
+    assert rebuilt_chunk == original_chunk
+    print("Reassembled size:", len(rebuilt_chunk))
+    print("Matches original:", rebuilt_chunk == original_chunk)
+
 
 if __name__ == "__main__":
     main()
