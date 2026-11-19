@@ -4,12 +4,18 @@ import queue
 import random
 import sys
 import time
+import struct
+from collections import deque
+import protocol_design
 
 messages = queue.Queue()
 peers = []
 last_seen = {}
 peer_lock = threading.Lock()
 sequence_lock = threading.Lock()
+chat_state_lock = threading.Lock()
+outgoing_chat_queues = {}
+pending_chats = {}
 
 PACKET_SEQUENCE_MAX = 0xFFFF
 CHAT_SEQUENCE_MAX = 0xFFFFFFFF
@@ -20,6 +26,7 @@ expected_chat_sequence_by_peer = {}
 
 HEARTBEAT_INTERVAL = 5
 PEER_TIMEOUT = 15
+CHAT_RETRY_INTERVAL = 1
 
 
 def peer_snapshot():
@@ -53,6 +60,7 @@ def remove_peer(peer_id, peer_addr=None):
 
     if removed:
         clear_peer_sequence_state(peer_id)
+        clear_pending_chat(peer_id)
 
     return removed
 
@@ -131,6 +139,93 @@ def send_chat_to_active_peers(chat_datagram):
     return recipients
 
 
+def queue_group_chat(text):
+    """Queue this chat separately for every peer currently in the group."""
+    # Validate the UTF-8 byte limit before placing the message in any queue.
+    protocol_design.make_chat_payload(1, text)
+    recipients = peer_snapshot()
+
+    if not recipients:
+        print("No active peers to send the chat to.")
+        return
+
+    with chat_state_lock:
+        for known_id, _ in recipients:
+            outgoing_chat_queues.setdefault(known_id, deque()).append(text)
+
+
+def clear_pending_chat(removed_peer_id):
+    """Drop queued and unacknowledged chats after a peer leaves or times out."""
+    with chat_state_lock:
+        queue_for_peer = outgoing_chat_queues.pop(removed_peer_id, deque())
+        pending = pending_chats.pop(removed_peer_id, None)
+
+    if pending is not None or queue_for_peer:
+        print(f"Chat delivery to peer {removed_peer_id} failed; peer was removed")
+
+
+def chat_sender():
+    """Send one CHAT at a time per peer and retry it unchanged until ACKed."""
+    while True:
+        now = time.monotonic()
+
+        for destination_id, destination_addr in peer_snapshot():
+            datagram_to_send = None
+
+            with chat_state_lock:
+                pending = pending_chats.get(destination_id)
+
+                if pending is not None and pending["acknowledged"]:
+                    pending_chats.pop(destination_id, None)
+                    pending = None
+
+                if pending is not None:
+                    if now - pending["sent_at"] >= CHAT_RETRY_INTERVAL:
+                        pending["sent_at"] = now
+                        datagram_to_send = pending["datagram"]
+                else:
+                    queue_for_peer = outgoing_chat_queues.get(destination_id)
+                    if queue_for_peer:
+                        text = queue_for_peer.popleft()
+                        packet_sequence = next_packet_sequence(destination_id)
+                        chat_sequence = next_chat_sequence(destination_id)
+                        datagram_to_send = protocol_design.make_datagram(
+                            packet_name="CHAT",
+                            peer_id=peer_id,
+                            destination_p_id=destination_id,
+                            protocol_version=protocol_design.PROTOCOL_VERSION,
+                            flags=0,
+                            group_id=0,
+                            seq_no=packet_sequence,
+                            payload=(chat_sequence, text),
+                        )
+                        pending_chats[destination_id] = {
+                            "seq_no": packet_sequence,
+                            "datagram": datagram_to_send,
+                            "addr": destination_addr,
+                            "sent_at": now,
+                            "acknowledged": False,
+                        }
+
+            if datagram_to_send is not None:
+                server.sendto(datagram_to_send, destination_addr)
+
+        time.sleep(0.05)
+
+
+def chat_input():
+    """Read chat lines from the terminal and queue them for active peers."""
+    while True:
+        try:
+            text = input()
+            if text:
+                queue_group_chat(text)
+        except (ValueError, UnicodeError) as error:
+            print(f"Cannot queue chat message: {error}")
+        except EOFError:
+            return
+
+
 def receive():
     while True:
         try:
@@ -195,11 +290,65 @@ def heartbeat():
         time.sleep(HEARTBEAT_INTERVAL)
 
 
+def handle_protocol_chat_or_ack(message, addr):
+    """Validate CHAT/ACK datagrams; ACK valid CHAT packets and never ACK ACKs."""
+    if len(message) < protocol_design.header_size:
+        return False
+
+    packet_type = message[4]
+    if packet_type not in (protocol_design.get_packet_type("CHAT"),
+                           protocol_design.get_packet_type("ACK")):
+        return False
+
+    try:
+        if packet_type == protocol_design.get_packet_type("CHAT"):
+            ack_datagram = protocol_design.make_ack_for_chat(message, peer_id)
+            chat_sequence, chat_text = protocol_design.decode_chat_payload(
+                message[protocol_design.header_size:]
+            )
+            sender_id = struct.unpack_from("!H", message, 0)[0]
+            server.sendto(ack_datagram, addr)
+            print(f"Chat from peer {sender_id} (sequence {chat_sequence}): {chat_text}")
+        else:
+            ack_no = protocol_design.check_datagram(message, show_output=False)
+            ack_fields = struct.unpack(
+                protocol_design.HEADER_FORMAT,
+                message[:protocol_design.header_size],
+            )
+            sender_id = ack_fields[0]
+            destination_id = ack_fields[1]
+            matching_peer = next(
+                (
+                    (known_id, known_addr)
+                    for known_id, known_addr in peer_snapshot()
+                    if known_id == sender_id and known_addr == addr
+                ),
+                None,
+            )
+
+            if destination_id == peer_id and matching_peer is not None:
+                with chat_state_lock:
+                    pending = pending_chats.get(sender_id)
+                    if (
+                        pending is not None
+                        and pending["addr"] == addr
+                        and pending["seq_no"] == ack_no
+                    ):
+                        pending["acknowledged"] = True
+    except ValueError as error:
+        print(f"Ignoring invalid protocol packet from {addr}: {error}")
+
+    return True
+
+
 def broadcast():
     while True:
         message, addr = messages.get()
 
         try:
+            if handle_protocol_chat_or_ack(message, addr):
+                continue
+
             text = message.decode("utf-8")
             print(text)
 
@@ -344,6 +493,8 @@ def main():
     threading.Thread(target=receive, daemon=True).start()
     threading.Thread(target=broadcast, daemon=True).start()
     threading.Thread(target=heartbeat, daemon=True).start()
+    threading.Thread(target=chat_sender, daemon=True).start()
+    threading.Thread(target=chat_input, daemon=True).start()
 
     if bootstrap_addr is not None:
         join(peer_id, bootstrap_addr)
