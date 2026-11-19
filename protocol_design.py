@@ -5,6 +5,9 @@ import socket
 HEADER_FORMAT = "!HHBBHIHHHH"
 header_size = struct.calcsize(HEADER_FORMAT)
 CHECKSUM_OFFSET = header_size - 2 #this beacure the last two bytes are the checksum bytes
+MAX_DATAGRAM_SIZE = 1024
+CHAT_SEQUENCE_SIZE = struct.calcsize("!I")
+MAX_CHAT_TEXT_BYTES = MAX_DATAGRAM_SIZE - header_size - CHAT_SEQUENCE_SIZE
 print(header_size)
 
 
@@ -33,20 +36,27 @@ def check_datagram(datagram):
 
     decoded_fields = struct.unpack(HEADER_FORMAT, datagram[:header_size])
 
-    if compute_checksum(datagram) != decoded_fields[9]:
-        raise ValueError("Checksum mismatch")
-
     actual_payload_length = len(datagram[header_size:])
     packet_type = decoded_fields[2]
     payload = datagram[header_size:]
 
+    if packet_type == 1:
+        if len(datagram) > MAX_DATAGRAM_SIZE:
+            raise ValueError("CHAT datagram exceeds 1024 bytes")
+
+        if actual_payload_length != decoded_fields[8]:
+            raise ValueError("CHAT payload length does not match its header")
+
+    if compute_checksum(datagram) != decoded_fields[9]:
+        raise ValueError("Checksum mismatch")
+
     if actual_payload_length == decoded_fields[8]:
         if packet_type == 1:
             print(struct.unpack(HEADER_FORMAT, datagram[:header_size]))
-            chat_sequence = struct.unpack("!I", payload[:4])[0]
-            message_delivered = payload[4:].decode("utf-8")
+            chat_sequence, message_delivered = decode_chat_payload(payload)
             print("Chat sequence:", chat_sequence)
             print(message_delivered)
+            return chat_sequence, message_delivered
 
         elif packet_type == 11:  # NEW_PEER
             if len(payload) != 8:
@@ -255,13 +265,53 @@ def get_file_id(file_path):
     return file_hash.digest()
 
 
+def make_chat_payload(chat_sequence, text):
+    if not isinstance(chat_sequence, int) or isinstance(chat_sequence, bool):
+        raise ValueError("chat_sequence must be an integer")
+
+    if not 1 <= chat_sequence <= 0xFFFFFFFF:
+        raise ValueError("chat_sequence must be between 1 and 4294967295")
+
+    if not isinstance(text, str):
+        raise ValueError("Chat text must be a string")
+
+    text_bytes = text.encode("utf-8")
+
+    if len(text_bytes) > MAX_CHAT_TEXT_BYTES:
+        raise ValueError(
+            f"Chat text exceeds the {MAX_CHAT_TEXT_BYTES}-byte limit"
+        )
+
+    return struct.pack("!I", chat_sequence) + text_bytes
+
+
+def decode_chat_payload(payload):
+    if len(payload) < CHAT_SEQUENCE_SIZE:
+        raise ValueError("CHAT payload is missing its chat sequence number")
+
+    if len(payload) > CHAT_SEQUENCE_SIZE + MAX_CHAT_TEXT_BYTES:
+        raise ValueError("CHAT payload exceeds the datagram size limit")
+
+    chat_sequence = struct.unpack("!I", payload[:CHAT_SEQUENCE_SIZE])[0]
+
+    if chat_sequence == 0:
+        raise ValueError("chat_sequence must start at 1")
+
+    try:
+        text = payload[CHAT_SEQUENCE_SIZE:].decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("CHAT text is not valid UTF-8") from error
+
+    return chat_sequence, text
+
+
 def make_payload(payload, packet_type):
     if packet_type == 0 or packet_type == 3 or packet_type == 4:
         return b""
 
     elif packet_type == 1:
         chat_sequence, text = payload
-        return struct.pack("!I", chat_sequence) + text.encode("utf-8")
+        return make_chat_payload(chat_sequence, text)
 
     elif packet_type == 2:
         file_id, chunk_index = payload
@@ -393,6 +443,10 @@ def make_datagram(
     ack_no=0,
 ):
     packet_type = get_packet_type(packet_name)
+
+    if packet_type == 1 and not 1 <= seq_no <= 0xFFFF:
+        raise ValueError("CHAT seq_no must be between 1 and 65535")
+
     payload_encoded = make_payload(payload, packet_type)
     datagram = None
 
@@ -771,6 +825,41 @@ def main():
         print("Header corruption detected.")
 
     print("Checksum tests passed.")
+
+    # Test the CHAT payload format and 1,024-byte datagram limit.
+    print("\nTesting CHAT payload format and size:")
+    sample_payload = make_chat_payload(7, "hello")
+    assert decode_chat_payload(sample_payload) == (7, "hello")
+
+    maximum_chat = make_datagram(
+        packet_name="CHAT",
+        peer_id=1001,
+        destination_p_id=1002,
+        protocol_version=1,
+        flags=0,
+        group_id=0,
+        seq_no=1,
+        payload=(1, "A" * MAX_CHAT_TEXT_BYTES),
+    )
+    assert len(maximum_chat) == MAX_DATAGRAM_SIZE
+
+    unicode_boundary = make_chat_payload(1, "é" * 500)
+    assert len(unicode_boundary) == CHAT_SEQUENCE_SIZE + MAX_CHAT_TEXT_BYTES
+
+    try:
+        make_chat_payload(1, "A" * (MAX_CHAT_TEXT_BYTES + 1))
+        raise AssertionError("Oversized CHAT text was accepted")
+    except ValueError:
+        print("CHAT text over 1,000 encoded bytes was rejected.")
+
+    try:
+        check_datagram(maximum_chat + b"x")
+        raise AssertionError("Oversized CHAT datagram was accepted")
+    except ValueError as error:
+        assert "1024 bytes" in str(error)
+        print("CHAT datagram over 1,024 bytes was rejected.")
+
+    print("CHAT payload and size tests passed.")
 
         # Test CHUNK_DATA fragmentation and reassembly.
     print("\nTesting CHUNK_DATA reassembly:")

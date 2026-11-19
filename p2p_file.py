@@ -9,6 +9,14 @@ messages = queue.Queue()
 peers = []
 last_seen = {}
 peer_lock = threading.Lock()
+sequence_lock = threading.Lock()
+
+PACKET_SEQUENCE_MAX = 0xFFFF
+CHAT_SEQUENCE_MAX = 0xFFFFFFFF
+next_packet_sequence_by_peer = {}
+next_chat_sequence_by_peer = {}
+expected_packet_sequence_by_peer = {}
+expected_chat_sequence_by_peer = {}
 
 HEARTBEAT_INTERVAL = 5
 PEER_TIMEOUT = 15
@@ -31,16 +39,86 @@ def add_peer(peer_id, peer_addr):
 
 
 def remove_peer(peer_id, peer_addr=None):
-    """Remove a peer by ID, optionally requiring its source address to match."""
+    """Remove a peer and discard its per-direction sequence state."""
+    removed = False
+
     with peer_lock:
         for known_id, known_addr in tuple(peers):
             if known_id == peer_id and (
                 peer_addr is None or known_addr == peer_addr
             ):
                 peers.remove((known_id, known_addr))
-                return True
+                removed = True
+                break
 
-    return False
+    if removed:
+        clear_peer_sequence_state(peer_id)
+
+    return removed
+
+
+def next_packet_sequence(destination_peer_id):
+    """Allocate the next 16-bit reliable-packet sequence for this direction."""
+    key = (peer_id, destination_peer_id)
+
+    with sequence_lock:
+        sequence = next_packet_sequence_by_peer.get(key, 1)
+        if sequence > PACKET_SEQUENCE_MAX:
+            raise OverflowError(
+                "Packet sequence exhausted; rejoin under a new peer ID"
+            )
+        next_packet_sequence_by_peer[key] = sequence + 1
+        return sequence
+
+
+def next_chat_sequence(destination_peer_id):
+    """Allocate the next 32-bit chat sequence for this recipient."""
+    key = (peer_id, destination_peer_id)
+
+    with sequence_lock:
+        sequence = next_chat_sequence_by_peer.get(key, 1)
+        if sequence > CHAT_SEQUENCE_MAX:
+            raise OverflowError(
+                "Chat sequence exhausted; rejoin under a new peer ID"
+            )
+        next_chat_sequence_by_peer[key] = sequence + 1
+        return sequence
+
+
+def expected_sequences_from(sender_peer_id):
+    """Return this receiver's expected packet and chat numbers from a sender."""
+    key = (sender_peer_id, peer_id)
+
+    with sequence_lock:
+        packet_sequence = expected_packet_sequence_by_peer.setdefault(key, 1)
+        chat_sequence = expected_chat_sequence_by_peer.setdefault(key, 1)
+        return packet_sequence, chat_sequence
+
+
+def advance_expected_sequences_from(sender_peer_id):
+    """Advance the two independent expected counters after an accepted CHAT."""
+    key = (sender_peer_id, peer_id)
+
+    with sequence_lock:
+        packet_sequence = expected_packet_sequence_by_peer.get(key, 1) + 1
+        chat_sequence = expected_chat_sequence_by_peer.get(key, 1) + 1
+        expected_packet_sequence_by_peer[key] = packet_sequence
+        expected_chat_sequence_by_peer[key] = chat_sequence
+        return packet_sequence, chat_sequence
+
+
+def clear_peer_sequence_state(removed_peer_id):
+    """Forget sequence counters in both directions when a peer is removed."""
+    with sequence_lock:
+        for sequence_map in (
+            next_packet_sequence_by_peer,
+            next_chat_sequence_by_peer,
+            expected_packet_sequence_by_peer,
+            expected_chat_sequence_by_peer,
+        ):
+            for peer_pair in tuple(sequence_map):
+                if removed_peer_id in peer_pair:
+                    sequence_map.pop(peer_pair, None)
 
 
 def send_chat_to_active_peers(chat_datagram):
