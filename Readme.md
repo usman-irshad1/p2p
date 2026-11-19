@@ -17,6 +17,7 @@ A student project to build a multi-peer group chat and file-sharing application 
 - [x] Local CHUNK_DATA fragmentation/reassembly demonstration: two 500-byte fragments reassembled into the original 1,000-byte chunk.
 - [x] Local peer discovery/heartbeat demonstration with three localhost peers.
 - [x] Local timeout demonstration showing a silent peer removed after its heartbeat timeout.
+- [x] Version 1 reliable ordered chat rules documented and approved; see [RELIABLE_CHAT_RULES.md](RELIABLE_CHAT_RULES.md). This is the protocol design only; reliable chat is not implemented yet.
 
 ### Still to implement or integrate
 
@@ -130,6 +131,10 @@ Measured performance graphs still need real test data. Planned graphs include ch
 - UDP does not guarantee delivery. The chat and file-transfer reliability features remain to be implemented.
 - The peer list is currently in memory; it is not persistent.
 - Localhost tests do not establish that peers can connect across different networks or through NAT.
+
+## Protocol design documents
+
+- [RELIABLE_CHAT_RULES.md](RELIABLE_CHAT_RULES.md) defines the approved version 1 rules for ordered, reliable chat: message sizing, per-peer sequence numbers, exact acknowledgments, retransmission, duplicate handling, and behavior when a peer fails. These rules still need to be implemented and tested in the live peer program.
 
 ## Evidence log
 
