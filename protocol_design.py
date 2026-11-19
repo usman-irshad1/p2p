@@ -8,7 +8,7 @@ CHECKSUM_OFFSET = header_size - 2 #this beacure the last two bytes are the check
 MAX_DATAGRAM_SIZE = 1024
 CHAT_SEQUENCE_SIZE = struct.calcsize("!I")
 MAX_CHAT_TEXT_BYTES = MAX_DATAGRAM_SIZE - header_size - CHAT_SEQUENCE_SIZE
-print(header_size)
+PROTOCOL_VERSION = 1
 
 
 # I am using the RFC 1071 standard for the checksum 
@@ -30,17 +30,30 @@ def compute_checksum(datagram): #ths is to get the value of the data gram by put
     return checksum(zeroed)
 
 
-def check_datagram(datagram):
+def check_datagram(datagram, show_output=True):
     if len(datagram) < header_size:
         raise ValueError("Datagram is shorter than the header")
 
     decoded_fields = struct.unpack(HEADER_FORMAT, datagram[:header_size])
 
+    if decoded_fields[3] != PROTOCOL_VERSION:
+        raise ValueError("Unsupported protocol version")
+
     actual_payload_length = len(datagram[header_size:])
     packet_type = decoded_fields[2]
     payload = datagram[header_size:]
 
+    if packet_type == 5:
+        if actual_payload_length != 0 or decoded_fields[8] != 0:
+            raise ValueError("ACK payload must be empty")
+        if decoded_fields[6] != 0:
+            raise ValueError("ACK seq_no must be zero")
+        if not 1 <= decoded_fields[7] <= 0xFFFF:
+            raise ValueError("ACK ack_no must identify a nonzero sequence")
+
     if packet_type == 1:
+        if not 1 <= decoded_fields[6] <= 0xFFFF:
+            raise ValueError("CHAT seq_no must be between 1 and 65535")
         if len(datagram) > MAX_DATAGRAM_SIZE:
             raise ValueError("CHAT datagram exceeds 1024 bytes")
 
@@ -52,10 +65,12 @@ def check_datagram(datagram):
 
     if actual_payload_length == decoded_fields[8]:
         if packet_type == 1:
-            print(struct.unpack(HEADER_FORMAT, datagram[:header_size]))
+            if show_output:
+                print(struct.unpack(HEADER_FORMAT, datagram[:header_size]))
             chat_sequence, message_delivered = decode_chat_payload(payload)
-            print("Chat sequence:", chat_sequence)
-            print(message_delivered)
+            if show_output:
+                print("Chat sequence:", chat_sequence)
+                print(message_delivered)
             return chat_sequence, message_delivered
 
         elif packet_type == 11:  # NEW_PEER
@@ -80,11 +95,10 @@ def check_datagram(datagram):
             print("No payload")
 
         elif packet_type == 5:
-            if len(payload) == 0:
-                ack_sequence_number = decoded_fields[7]
+            ack_sequence_number = decoded_fields[7]
+            if show_output:
                 print(ack_sequence_number)
-            else:
-                print("The packet is invalid")
+            return ack_sequence_number
 
         elif packet_type == 6:  # JOIN_ACK
             if len(payload) < 2:
@@ -447,6 +461,16 @@ def make_datagram(
     if packet_type == 1 and not 1 <= seq_no <= 0xFFFF:
         raise ValueError("CHAT seq_no must be between 1 and 65535")
 
+    if packet_type == 5:
+        if seq_no != 0:
+            raise ValueError("ACK seq_no must be zero")
+        if not isinstance(ack_no, int) or isinstance(ack_no, bool):
+            raise ValueError("ACK requires an integer ack_no")
+        if not 1 <= ack_no <= 0xFFFF:
+            raise ValueError("ACK ack_no must be between 1 and 65535")
+        if payload is not None:
+            raise ValueError("ACK payload must be empty")
+
     payload_encoded = make_payload(payload, packet_type)
     datagram = None
 
@@ -531,11 +555,6 @@ def make_datagram(
         datagram = header_bytes + payload_encoded
 
     if packet_type == 5:  # ACK
-        if ack_no is None:
-            raise ValueError(
-                "ACK requires the sequence number being acknowledged"
-            )
-
         fields = (
             peer_id,
             destination_p_id,
@@ -660,7 +679,53 @@ def make_datagram(
     )
 
 
+def make_ack_datagram(
+    receiver_peer_id,
+    sender_peer_id,
+    acknowledged_seq_no,
+    protocol_version=PROTOCOL_VERSION,
+    group_id=0,
+):
+    """Build an empty ACK whose ack_no names the exact CHAT header seq_no."""
+    return make_datagram(
+        packet_name="ACK",
+        peer_id=receiver_peer_id,
+        destination_p_id=sender_peer_id,
+        protocol_version=protocol_version,
+        flags=0,
+        group_id=group_id,
+        seq_no=0,
+        ack_no=acknowledged_seq_no,
+        payload=None,
+    )
+
+
+def make_ack_for_chat(chat_datagram, receiver_peer_id):
+    """Validate a CHAT fully, then build its exact-sequence ACK."""
+    if len(chat_datagram) < header_size:
+        raise ValueError("Datagram is shorter than the header")
+
+    chat_fields = struct.unpack(HEADER_FORMAT, chat_datagram[:header_size])
+    if chat_fields[2] != get_packet_type("CHAT"):
+        raise ValueError("Can only ACK a CHAT packet")
+    if chat_fields[1] != receiver_peer_id:
+        raise ValueError("CHAT packet is addressed to a different peer")
+
+    # This validates protocol version, checksum, lengths, sequence and UTF-8.
+    check_datagram(chat_datagram, show_output=False)
+
+    return make_ack_datagram(
+        receiver_peer_id=receiver_peer_id,
+        sender_peer_id=chat_fields[0],
+        acknowledged_seq_no=chat_fields[6],
+        protocol_version=chat_fields[3],
+        group_id=chat_fields[5],
+    )
+
+
 def main():
+    print(header_size)
+
     # Test ACK.
     ack_packet = make_datagram(
         packet_name="ACK",
@@ -669,18 +734,20 @@ def main():
         protocol_version=1,
         flags=0,
         group_id=0,
-        seq_no=1,
+        seq_no=0,
         ack_no=12,
         payload=None,
     )
 
     print("Testing ACK:")
-    check_datagram(ack_packet)
+    decoded_ack_sequence = check_datagram(ack_packet)
 
     ack_fields = struct.unpack(HEADER_FORMAT, ack_packet[:header_size])
     assert ack_fields[2] == 5
+    assert ack_fields[6] == 0
     assert ack_fields[7] == 12
     assert ack_fields[8] == 0
+    assert decoded_ack_sequence == 12
 
     # Test JOIN_ACK with two peers.
     peer_list = [
