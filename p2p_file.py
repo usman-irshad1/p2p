@@ -190,6 +190,55 @@ def broadcast():
         finally:
             messages.task_done()
 
+def test_peer_helpers():
+    first_receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    second_receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    first_receiver.bind(("127.0.0.1", 0))
+    second_receiver.bind(("127.0.0.1", 0))
+    first_receiver.settimeout(2)
+    second_receiver.settimeout(2)
+
+    original_peers = peer_snapshot()
+
+    try:
+        with peer_lock:
+            peers.clear()
+
+        first_addr = first_receiver.getsockname()
+        second_addr = second_receiver.getsockname()
+
+        assert add_peer(65001, first_addr)
+        first_snapshot = peer_snapshot()
+
+        assert add_peer(65002, second_addr)
+        assert not add_peer(65001, first_addr)
+        assert first_snapshot == ((65001, first_addr),)
+
+        test_datagram = b"rule-1-routing-test"
+        recipients = send_chat_to_active_peers(test_datagram)
+
+        assert recipients == (
+            (65001, first_addr),
+            (65002, second_addr),
+        )
+        assert first_receiver.recvfrom(1024)[0] == test_datagram
+        assert second_receiver.recvfrom(1024)[0] == test_datagram
+
+        assert not remove_peer(65001, second_addr)
+        assert remove_peer(65001, first_addr)
+        assert remove_peer(65002)
+        assert peer_snapshot() == ()
+
+        print("Peer helper tests passed.")
+
+    finally:
+        with peer_lock:
+            peers[:] = original_peers
+
+        first_receiver.close()
+        second_receiver.close()
+
 
 def main():
     global server, local_port, bootstrap_addr
@@ -206,8 +255,13 @@ def main():
 
     server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     server.bind(("0.0.0.0", local_port))
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.bind(("0.0.0.0", local_port))
+
+    test_peer_helpers()
 
     peer_id = id_generation()
+
 
     threading.Thread(target=receive, daemon=True).start()
     threading.Thread(target=broadcast, daemon=True).start()
