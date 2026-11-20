@@ -23,6 +23,7 @@ next_packet_sequence_by_peer = {}
 next_chat_sequence_by_peer = {}
 expected_packet_sequence_by_peer = {}
 expected_chat_sequence_by_peer = {}
+received_chat_pairs_by_peer = {}
 
 HEARTBEAT_INTERVAL = 5
 PEER_TIMEOUT = 15
@@ -59,6 +60,7 @@ def remove_peer(peer_id, peer_addr=None):
                 break
 
     if removed:
+        last_seen.pop(peer_id, None)
         clear_peer_sequence_state(peer_id)
         clear_pending_chat(peer_id)
 
@@ -123,10 +125,38 @@ def clear_peer_sequence_state(removed_peer_id):
             next_chat_sequence_by_peer,
             expected_packet_sequence_by_peer,
             expected_chat_sequence_by_peer,
+            received_chat_pairs_by_peer,
         ):
             for peer_pair in tuple(sequence_map):
                 if removed_peer_id in peer_pair:
                     sequence_map.pop(peer_pair, None)
+
+
+def classify_incoming_chat(sender_peer_id, packet_sequence, chat_sequence):
+    """Accept the expected CHAT, recognize exact retransmits, or reject gaps."""
+    key = (sender_peer_id, peer_id)
+
+    with sequence_lock:
+        expected_packet = expected_packet_sequence_by_peer.setdefault(key, 1)
+        expected_chat = expected_chat_sequence_by_peer.setdefault(key, 1)
+        received_pairs = received_chat_pairs_by_peer.setdefault(key, {})
+
+        if (
+            packet_sequence == expected_packet
+            and chat_sequence == expected_chat
+        ):
+            expected_packet_sequence_by_peer[key] = expected_packet + 1
+            expected_chat_sequence_by_peer[key] = expected_chat + 1
+            received_pairs[packet_sequence] = chat_sequence
+            return "accepted"
+
+        if (
+            packet_sequence < expected_packet
+            and received_pairs.get(packet_sequence) == chat_sequence
+        ):
+            return "duplicate"
+
+        return "reject"
 
 
 def send_chat_to_active_peers(chat_datagram):
@@ -302,13 +332,43 @@ def handle_protocol_chat_or_ack(message, addr):
 
     try:
         if packet_type == protocol_design.get_packet_type("CHAT"):
-            ack_datagram = protocol_design.make_ack_for_chat(message, peer_id)
-            chat_sequence, chat_text = protocol_design.decode_chat_payload(
-                message[protocol_design.header_size:]
+            fields = struct.unpack(
+                protocol_design.HEADER_FORMAT,
+                message[:protocol_design.header_size],
             )
-            sender_id = struct.unpack_from("!H", message, 0)[0]
-            server.sendto(ack_datagram, addr)
-            print(f"Chat from peer {sender_id} (sequence {chat_sequence}): {chat_text}")
+            sender_id = fields[0]
+            destination_id = fields[1]
+            packet_sequence = fields[6]
+
+            # Validate version, checksum, header/payload lengths, and UTF-8.
+            chat_sequence, chat_text = protocol_design.check_datagram(
+                message,
+                show_output=False,
+            )
+
+            known_sender = any(
+                known_id == sender_id and known_addr == addr
+                for known_id, known_addr in peer_snapshot()
+            )
+
+            if destination_id != peer_id or not known_sender:
+                return True
+
+            status = classify_incoming_chat(
+                sender_id,
+                packet_sequence,
+                chat_sequence,
+            )
+
+            if status in ("accepted", "duplicate"):
+                ack_datagram = protocol_design.make_ack_for_chat(message, peer_id)
+                server.sendto(ack_datagram, addr)
+
+                if status == "accepted":
+                    print(
+                        f"Chat from peer {sender_id} "
+                        f"(sequence {chat_sequence}): {chat_text}"
+                    )
         else:
             ack_no = protocol_design.check_datagram(message, show_output=False)
             ack_fields = struct.unpack(
@@ -335,7 +395,7 @@ def handle_protocol_chat_or_ack(message, addr):
                         and pending["seq_no"] == ack_no
                     ):
                         pending["acknowledged"] = True
-    except ValueError as error:
+    except (ValueError, UnicodeDecodeError) as error:
         print(f"Ignoring invalid protocol packet from {addr}: {error}")
 
     return True
