@@ -212,7 +212,9 @@ Current basic flow: after at least four peers join, `/index <path>` hashes a fil
 
 After a graceful LEAVE or heartbeat timeout, each peer removes the departed owner from its catalog. If a chunk is under-replicated and a surviving owner has the local chunk bytes, the lowest-ID surviving owner sends `REPLICATE_REQ` to an unassigned active peer. It retries the request periodically until a `CHUNK_HAVE` announcement restores the two-owner count. If no surviving peer has the chunk bytes, this mechanism cannot recover it.
 
-Limitations: initial placement runs only when `/index` is issued and needs four peers and at least two chunks. Automatic repair is implemented but still needs live multi-peer verification. Fragment-level ACKs and automatic rebalancing when a new peer joins remain unimplemented.
+When a peer joins, it uses the current peer IDs and balanced placement algorithm to find chunks assigned to it. As existing owners send `FILE_LIST` and `CHUNK_HAVE`, the joining peer requests each missing assigned chunk with `CHUNK_REQUEST`, stores the data, and announces ownership with `CHUNK_HAVE`.
+
+Limitations: initial placement runs only when `/index` is issued and needs four peers and at least two chunks. Join rebalancing adds the joining peer's assigned copies but does not delete older replicas, so extra copies can remain. Automatic repair and join rebalancing are implemented but still need live multi-peer verification. Fragment-level ACKs and safe removal of surplus replicas remain unimplemented.
 
 ## 7. Current implementation inventory
 

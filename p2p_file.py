@@ -15,6 +15,7 @@ messages = queue.Queue()
 peers = []
 last_seen = {}
 bootstrap_addr = None
+joined_network = False
 peer_lock = threading.Lock()
 sequence_lock = threading.Lock()
 chat_state_lock = threading.Lock()
@@ -425,6 +426,83 @@ def repair_under_replicated_chunks():
                 pending_chunk_repairs.pop(repair_key, None)
 
     return requests_sent
+
+
+def rebalance_chunk_from_peers(file_id, chunk_index):
+    """Fetch one chunk assigned to this peer by the current placement plan."""
+    task_key = (file_id, chunk_index, peer_id)
+    try:
+        request_chunk(file_id, chunk_index)
+        print(
+            f"Rebalanced chunk {chunk_index} of {file_id.hex()[:8]} "
+            f"onto peer {peer_id}"
+        )
+    except (OSError, ValueError, TimeoutError) as error:
+        print(
+            f"Could not rebalance chunk {chunk_index} of "
+            f"{file_id.hex()[:8]}: {error}"
+        )
+    finally:
+        with chunk_download_lock:
+            active_replication_tasks.discard(task_key)
+
+
+def rebalance_chunks_for_local_peer():
+    """Fetch missing chunks assigned to this peer when it joins the network.
+
+    Existing replicas are kept; rebalancing adds the new placement's copies
+    without deleting any data from current owners.
+    """
+    if not joined_network:
+        return 0
+
+    participants = {peer_id}
+    participants.update(known_id for known_id, _ in peer_snapshot())
+    if len(participants) < MIN_DISTRIBUTION_PEERS:
+        return 0
+
+    with file_catalog_lock:
+        file_entries = tuple(
+            (
+                file_id,
+                metadata["chunk_count"],
+                {
+                    chunk_index: set(owners)
+                    for chunk_index, owners in metadata["chunk_owners"].items()
+                },
+            )
+            for file_id, metadata in file_catalog_state.items()
+        )
+
+    tasks_started = 0
+    for file_id, chunk_count, chunk_owners in file_entries:
+        placement = plan_chunk_owners(chunk_count, participants)
+        for chunk_index, designated_owners in placement.items():
+            if peer_id not in designated_owners:
+                continue
+            if peer_id in chunk_owners[chunk_index]:
+                continue
+
+            if chunk_store.has_chunk(CHUNK_STORE_DIR, file_id, chunk_index):
+                announce_chunk_have(file_id, chunk_index)
+                continue
+            if not chunk_owners[chunk_index]:
+                continue
+
+            task_key = (file_id, chunk_index, peer_id)
+            with chunk_download_lock:
+                if task_key in active_replication_tasks:
+                    continue
+                active_replication_tasks.add(task_key)
+
+            threading.Thread(
+                target=rebalance_chunk_from_peers,
+                args=(file_id, chunk_index),
+                daemon=True,
+            ).start()
+            tasks_started += 1
+
+    return tasks_started
 
 
 def register_file_metadata(file_path):
@@ -1093,6 +1171,7 @@ def handle_protocol_catalog(message, addr):
                     owner_id,
                     owner_addr,
                 )
+            rebalance_chunks_for_local_peer()
         else:
             with file_catalog_lock:
                 if file_id in file_catalog_state:
@@ -1112,6 +1191,7 @@ def handle_protocol_catalog(message, addr):
                     f"from peer {sender_id}"
                 )
                 maybe_release_staged_chunk(file_id, chunk_index)
+            rebalance_chunks_for_local_peer()
 
     except (ValueError, UnicodeDecodeError, KeyError) as error:
         print(f"Ignoring invalid catalog packet from {addr}: {error}")
@@ -1227,6 +1307,8 @@ def handle_chunk_transfer(message, addr):
 
 
 def broadcast():
+    global joined_network
+
     while True:
         message, addr = messages.get()
 
@@ -1273,7 +1355,9 @@ def broadcast():
                             last_seen[known_id] = time.monotonic()
 
                 print("Updated peer list:", peer_snapshot())
+                joined_network = True
                 broadcast_file_catalog()
+                rebalance_chunks_for_local_peer()
 
             elif text.startswith("new_peer:"):
                 peer_info = text.split(":", 1)[1]
@@ -1363,10 +1447,11 @@ def test_peer_helpers():
 
 def main():
     global server, local_port, bootstrap_addr
-    global advertise_ip, peer_id
+    global advertise_ip, peer_id, joined_network
 
     local_port = int(sys.argv[1])
     bootstrap_addr = None
+    joined_network = False
 
     if len(sys.argv) > 2:
         host, port = sys.argv[2].rsplit(":", 1)
