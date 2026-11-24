@@ -4,7 +4,7 @@ A student project to build a multi-peer group chat and file-sharing application 
 
 ## Project status
 
-**Approximate implementation coverage: 70%.** The latest chunk placement and transfer code has not yet been run live; treat this percentage as a planning estimate until the four-peer demo succeeds.
+**Approximate implementation coverage: 80%.** Automatic replica repair is now connected to graceful leave and heartbeat-timeout handling. The file-transfer and repair paths still need live multi-peer checks; treat this percentage as a planning estimate until the four-peer demo succeeds.
 
 ### Implemented or prototyped
 
@@ -22,6 +22,7 @@ A student project to build a multi-peer group chat and file-sharing application 
 - [x] `/index <path>` splits a file into 256 KiB chunks; with at least four peers, it assigns two distinct peers per chunk and asks remote owners to copy their assigned chunks.
 - [x] `/download <file_id_hex> [output_path]` requests chunks in parallel batches of four and verifies the rebuilt file's SHA-256.
 - [x] CHUNK_REQUEST and fragmented CHUNK_DATA transfer are connected to the live UDP message loop; each request is sent up to three times, and temporary source copies are removed after both assigned peers announce ownership.
+- [x] On LEAVE or heartbeat timeout, the lowest-ID surviving owner asks an unassigned peer to copy an under-replicated chunk; repair requests retry until a replacement owner is announced.
 - [x] Local screenshots show peers joining and receiving sequential chat messages. Evidence is collected in [the debugging PDF](evidence/p2p_debug_outputs.pdf).
 
 ### Remaining for the full assignment
@@ -30,7 +31,7 @@ A student project to build a multi-peer group chat and file-sharing application 
 - [ ] Replace the remaining text-based membership messages with the specified binary protocol packets.
 - [ ] Prepare at least two files of 2 MB or larger; split them into fixed-size chunks.
 - [ ] Verify live that each chunk has two owners and no peer's chunk store holds the complete file.
-- [ ] Re-replicate chunks automatically when an owner leaves or times out.
+- [x] Implement automatic re-replication after an owner leaves or times out; live verification remains pending.
 - [ ] Automatically rebalance existing file chunks when a new peer joins.
 - [ ] Demonstrate a multi-source download with chunks coming from at least two peers.
 - [ ] Test source failure during download and continue from another replica.

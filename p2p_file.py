@@ -28,6 +28,8 @@ pending_chunk_downloads = {}
 pending_replication_requests = set()
 active_replication_tasks = set()
 chunk_placement_state = {}
+pending_chunk_repairs = {}
+chunk_repair_lock = threading.Lock()
 
 PACKET_SEQUENCE_MAX = 0xFFFF
 CHAT_SEQUENCE_MAX = 0xFFFFFFFF
@@ -46,6 +48,7 @@ CHUNK_FRAGMENT_DATA_SIZE = (
     protocol_design.MAX_DATAGRAM_SIZE - protocol_design.header_size - 44
 )
 CHUNK_REQUEST_TIMEOUT = 5
+CHUNK_REPAIR_RETRY_INTERVAL = CHUNK_REQUEST_TIMEOUT * 2
 MIN_DISTRIBUTION_PEERS = 4
 MAX_FILE_LIST_FILENAME_BYTES = (
     protocol_design.MAX_DATAGRAM_SIZE
@@ -93,6 +96,12 @@ def remove_peer(peer_id, peer_addr=None):
             pending_chunk_have.difference_update({
                 item for item in pending_chunk_have if item[2] == peer_id
             })
+        with chunk_repair_lock:
+            for repair_key, (target_id, sent_at) in tuple(
+                pending_chunk_repairs.items()
+            ):
+                if target_id == peer_id:
+                    pending_chunk_repairs.pop(repair_key, None)
 
     return removed
 
@@ -331,6 +340,89 @@ def distribute_file_chunks(file_id):
             )
             server.sendto(request_datagram, owner_addr)
             requests_sent += 1
+
+    return requests_sent
+
+
+def repair_under_replicated_chunks():
+    """Ask a surviving chunk owner to create a replacement replica."""
+    known_peer_ids = {known_id for known_id, _ in peer_snapshot()}
+    known_peer_ids.add(peer_id)
+    now = time.monotonic()
+
+    with file_catalog_lock:
+        under_replicated = file_catalog_helpers.under_replicated_chunks(
+            file_catalog_state,
+            minimum_replicas=2,
+        )
+
+    under_replicated_keys = {
+        (file_id, chunk_index)
+        for file_id, chunk_index, owners in under_replicated
+    }
+    with chunk_repair_lock:
+        for repair_key, (target_id, sent_at) in tuple(
+            pending_chunk_repairs.items()
+        ):
+            if repair_key not in under_replicated_keys or target_id not in known_peer_ids:
+                pending_chunk_repairs.pop(repair_key, None)
+
+    peer_addresses = dict(peer_snapshot())
+    requests_sent = 0
+
+    for file_id, chunk_index, owner_ids in under_replicated:
+        owners = set(owner_ids)
+
+        # Every peer sees the departure; the lowest surviving owner coordinates
+        # the repair so the group does not start duplicate transfers.
+        if not owners or peer_id != min(owners):
+            continue
+        if not chunk_store.has_chunk(CHUNK_STORE_DIR, file_id, chunk_index):
+            continue
+
+        candidates = sorted(known_peer_ids - owners - {peer_id})
+        if not candidates:
+            continue
+
+        repair_key = (file_id, chunk_index)
+        with chunk_repair_lock:
+            pending = pending_chunk_repairs.get(repair_key)
+            if pending is not None:
+                target_id, sent_at = pending
+                if target_id in candidates and now - sent_at < CHUNK_REPAIR_RETRY_INTERVAL:
+                    continue
+                if target_id not in candidates:
+                    target_id = candidates[0]
+            else:
+                target_id = candidates[0]
+            pending_chunk_repairs[repair_key] = (target_id, now)
+
+        target_addr = peer_addresses.get(target_id)
+        if target_addr is None:
+            with chunk_repair_lock:
+                pending_chunk_repairs.pop(repair_key, None)
+            continue
+
+        try:
+            datagram = protocol_design.make_datagram(
+                packet_name="REPLICATE_REQ",
+                peer_id=peer_id,
+                destination_p_id=target_id,
+                protocol_version=protocol_design.PROTOCOL_VERSION,
+                flags=0,
+                group_id=0,
+                seq_no=0,
+                payload=(file_id, chunk_index),
+            )
+            server.sendto(datagram, target_addr)
+            requests_sent += 1
+            print(
+                f"Requested replacement replica for chunk {chunk_index} "
+                f"of {file_id.hex()[:8]} from peer {target_id}"
+            )
+        except OSError:
+            with chunk_repair_lock:
+                pending_chunk_repairs.pop(repair_key, None)
 
     return requests_sent
 
@@ -834,6 +926,7 @@ def heartbeat():
             last_seen.pop(expired_id, None)
             print(f"Peer {expired_id} timed out and was removed")
 
+        repair_under_replicated_chunks()
         time.sleep(HEARTBEAT_INTERVAL)
 
 
@@ -1209,6 +1302,7 @@ def broadcast():
                 leaving_id=int(text.split(":", 1)[1])
                 if remove_peer(leaving_id, addr):
                     last_seen.pop(leaving_id, None)
+                    repair_under_replicated_chunks()
 
                 print("Updated peer list:", peer_snapshot())
 

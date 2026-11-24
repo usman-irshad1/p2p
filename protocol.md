@@ -210,7 +210,9 @@ Current status: binary CHAT and ACK are used by the live P2P program with per-pe
 
 Current basic flow: after at least four peers join, `/index <path>` hashes a file, divides it into 256 KiB chunks, balances two owners per chunk, advertises metadata/ownership, and sends REPLICATE_REQ to remote owners. A destination requests its chunk, reassembles CHUNK_DATA, stores it, and announces CHUNK_HAVE. The source removes its temporary chunk copy after both assigned peers report ownership. A requester uses `/download <file_id_hex> [output_path]`; it fetches chunks in parallel batches of up to four, sends each request up to three times before trying another advertised owner, rebuilds the file, and verifies its SHA-256 against the file ID.
 
-Limitations: placement runs only when `/index` is issued and needs four peers and at least two chunks. If replication fails, the source retains temporary chunk copies. Automatic re-replication after peer loss, fragment-level ACKs, and live verification still need work.
+After a graceful LEAVE or heartbeat timeout, each peer removes the departed owner from its catalog. If a chunk is under-replicated and a surviving owner has the local chunk bytes, the lowest-ID surviving owner sends `REPLICATE_REQ` to an unassigned active peer. It retries the request periodically until a `CHUNK_HAVE` announcement restores the two-owner count. If no surviving peer has the chunk bytes, this mechanism cannot recover it.
+
+Limitations: initial placement runs only when `/index` is issued and needs four peers and at least two chunks. Automatic repair is implemented but still needs live multi-peer verification. Fragment-level ACKs and automatic rebalancing when a new peer joins remain unimplemented.
 
 ## 7. Current implementation inventory
 
