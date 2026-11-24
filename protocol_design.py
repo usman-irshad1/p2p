@@ -33,6 +33,8 @@ def compute_checksum(datagram): #ths is to get the value of the data gram by put
 def check_datagram(datagram, show_output=True):
     if len(datagram) < header_size:
         raise ValueError("Datagram is shorter than the header")
+    if len(datagram) > MAX_DATAGRAM_SIZE:
+        raise ValueError("Datagram exceeds 1,024 bytes")
 
     decoded_fields = struct.unpack(HEADER_FORMAT, datagram[:header_size])
 
@@ -82,14 +84,27 @@ def check_datagram(datagram, show_output=True):
             print("New peer:", known_id, ip, port)
             return known_id, ip, port
 
-        elif packet_type == 2 or packet_type == 9:
-            if len(payload) == 36:
-                file_id = payload[:32]
-                chunk_index = struct.unpack("!I", payload[-4:])[0]
+        elif packet_type == 2:
+            if len(payload) != 36:
+                raise ValueError("CHUNK_REQUEST payload must be exactly 36 bytes")
+
+            file_id = payload[:32]
+            chunk_index = struct.unpack("!I", payload[32:])[0]
+            if show_output:
                 print("file_id:", file_id.hex())
                 print("chunk_index:", chunk_index)
-            else:
-                print("The packet length is invalid")
+            return file_id, chunk_index
+
+        elif packet_type == 9:  # CHUNK_HAVE
+            if len(payload) != 36:
+                raise ValueError("CHUNK_HAVE payload must be exactly 36 bytes")
+
+            file_id = payload[:32]
+            chunk_index = struct.unpack("!I", payload[32:])[0]
+            if show_output:
+                print("file_id:", file_id.hex())
+                print("chunk_index:", chunk_index)
+            return file_id, chunk_index
 
         elif packet_type == 0 or packet_type == 3 or packet_type == 4:
             print("No payload")
@@ -124,10 +139,13 @@ def check_datagram(datagram, show_output=True):
                 ip = socket.inet_ntoa(ip_bytes)
                 peers_in_ack.append((known_id, ip, port))
 
-            print("Acknowledged JOIN sequence:", decoded_fields[7])
-            print("Peers in JOIN_ACK:", peers_in_ack)
+            if show_output:
+                print("Acknowledged JOIN sequence:", decoded_fields[7])
+                print("Peers in JOIN_ACK:", peers_in_ack)
 
         elif packet_type == 7:  # CHUNK_DATA
+            if len(datagram) > MAX_DATAGRAM_SIZE:
+                raise ValueError("CHUNK_DATA datagram exceeds 1,024 bytes")
             if len(payload) < 44:
                 raise ValueError("CHUNK_DATA payload is missing metadata")
 
@@ -139,11 +157,12 @@ def check_datagram(datagram, show_output=True):
             if fragment_offset + len(fragment_data) > total_chunk_size:
                 raise ValueError("Fragment extends beyond the chunk")
 
-            print("file_id:", file_id.hex())
-            print("chunk_index:", chunk_index)
-            print("fragment_offset:", fragment_offset)
-            print("total_chunk_size:", total_chunk_size)
-            print("fragment bytes:", len(fragment_data))
+            if show_output:
+                print("file_id:", file_id.hex())
+                print("chunk_index:", chunk_index)
+                print("fragment_offset:", fragment_offset)
+                print("total_chunk_size:", total_chunk_size)
+                print("fragment bytes:", len(fragment_data))
 
             return (
                 file_id,
@@ -189,9 +208,10 @@ def check_datagram(datagram, show_output=True):
             if position != len(payload):
                 raise ValueError("FILE_LIST contains unexpected extra bytes")
 
-            print("Files in FILE_LIST:")
-            for file_id, file_size, chunk_size, filename in files:
-                print(file_id.hex(), file_size, chunk_size, filename)
+            if show_output:
+                print("Files in FILE_LIST:")
+                for file_id, file_size, chunk_size, filename in files:
+                    print(file_id.hex(), file_size, chunk_size, filename)
 
             return files
 
@@ -204,15 +224,16 @@ def check_datagram(datagram, show_output=True):
             file_id = payload[:32]
             chunk_index = struct.unpack("!I", payload[32:])[0]
 
-            print("REPLICATE_REQ file_id:", file_id.hex())
-            print("REPLICATE_REQ chunk_index:", chunk_index)
+            if show_output:
+                print("REPLICATE_REQ file_id:", file_id.hex())
+                print("REPLICATE_REQ chunk_index:", chunk_index)
 
             return file_id, chunk_index
 
 
 
     else:
-        print("corruption in the payload")
+        raise ValueError("Payload length does not match its header")
 
 
 def reassemble_chunk(fragments):

@@ -6,7 +6,7 @@
 
 This is an application-layer protocol carried in UDP datagrams. Each peer has a UDP socket and can send to and receive from other peers. A bootstrap peer may help a newcomer discover the group, but it is not a permanent server and does not store the group's files centrally.
 
-The current `p2p_file.py` prototype sends text messages such as `join:`, `join_ack:`, `new_peer:`, `heartbeat:`, and `leave:`. The binary header and payload helpers described below are in `protocol_design.py`; they are not yet integrated into the live peer program.
+The current `p2p_file.py` uses text messages for membership (`join:`, `join_ack:`, `new_peer:`, `heartbeat:`, and `leave:`), and binary protocol datagrams for chat and file catalog/chunk transfer. The project is still a prototype: chunks are currently stored in full on the peer that indexes a file, before distributed placement and replication are added.
 
 ## 2. Datagram layout
 
@@ -35,7 +35,7 @@ HEADER_FORMAT = "!HHBBHIHHHH"
 | 7 | Sequence number | `H` | 2 bytes | Proposed per-sender/per-destination packet sequence. |
 | 8 | Acknowledgment number | `H` | 2 bytes | Proposed exact ACK value; see Section 5. |
 | 9 | Payload length | `H` | 2 bytes | Number of payload bytes, excluding the 20-byte header. |
-| 10 | Checksum | `H` | 2 bytes | **Pending:** currently supplied as zero; algorithm and coverage are not implemented. |
+| 10 | Checksum | `H` | 2 bytes | 16-bit one's-complement Internet checksum over the full datagram with this field zeroed during calculation. |
 
 ### Peer IDs and broadcast
 
@@ -49,7 +49,7 @@ HEADER_FORMAT = "!HHBBHIHHHH"
 
 - `payload_length` counts bytes, not characters.
 - The receiver must reject a datagram when the actual payload length does not equal this field.
-- **Pending:** choose a maximum datagram size. The current `p2p_file.py` calls `recvfrom(1024)`, which can truncate larger datagrams. Chunk fragments must fit within the selected datagram limit after the 20-byte header and 44-byte CHUNK_DATA metadata.
+- Maximum UDP application datagram: 1,024 bytes. The receiver uses `recvfrom(1024)` and the parser rejects larger messages. A CHUNK_DATA fragment can carry up to 960 data bytes after its 20-byte header and 44-byte fragment metadata.
 
 ## 3. Packet type registry
 
@@ -59,16 +59,16 @@ Packet type numbers currently assigned in `protocol_design.py`:
 |---:|---|---|---|
 | 0 | JOIN | Empty | Empty payload helper exists. Live peer discovery currently sends text JOIN. |
 | 1 | CHAT | `uint32 chat_sequence` followed by UTF-8 text | Encoder and partial parser exist. |
-| 2 | CHUNK_REQUEST | 32-byte file ID + `uint32 chunk_index` | Encoder and parser exist. |
+| 2 | CHUNK_REQUEST | 32-byte file ID + `uint32 chunk_index` | Live handler requests a locally stored chunk. |
 | 3 | LEAVE | Empty | Empty payload helper exists. Live peer discovery currently sends text LEAVE. |
 | 4 | HEARTBEAT | Empty | Empty payload helper exists. Live peer discovery currently sends text heartbeat. |
 | 5 | ACK | Empty; acknowledgment number is in header `ack_no` | Encoder exists; parser/reliability behavior remains incomplete. |
 | 6 | JOIN_ACK | `uint16 peer_count`, then peer records | Encoder exists; parser remains incomplete. |
-| 7 | CHUNK_DATA | 44-byte metadata followed by fragment bytes | Encoder, partial parser, and local reassembly demo exist. |
-| 8 | FILE_LIST | **Pending** | Packet ID exists; payload format/encoder/parser are missing. |
-| 9 | CHUNK_HAVE | 32-byte file ID + `uint32 chunk_index` | Encoder and parser exist. |
-| 10 | REPLICATE_REQ | **Pending** | Packet ID exists; payload format/encoder/parser are missing. |
-| 11 | NEW_PEER | Proposed: one peer record | ID is assigned in pasted code, but the name, encoder, parser, and datagram branch need completion. Use the consistent spelling `NEW_PEER`. |
+| 7 | CHUNK_DATA | 44-byte metadata followed by fragment bytes | Live handler sends/collects fragments and stores a rebuilt chunk. |
+| 8 | FILE_LIST | `uint16 count`, then file records | Encoder/parser and live metadata exchange exist. |
+| 9 | CHUNK_HAVE | 32-byte file ID + `uint32 chunk_index` | Encoder/parser and live ownership update exist. |
+| 10 | REPLICATE_REQ | 32-byte file ID + `uint32 chunk_index` | Encoder/parser exist; receiver asks the sender for its assigned chunk copy. |
+| 11 | NEW_PEER | One 8-byte peer record | Encoder/parser exist; live membership still uses the text message. |
 
 The registry is not complete until every type has a precise purpose, payload layout, and message flow, or is explicitly marked reserved for a later version.
 
@@ -118,7 +118,7 @@ Payload:
 uint32 chunk_index
 ```
 
-The current `get_file_id()` helper computes a 32-byte SHA-256 digest of the complete file. The project should document whether the same full-file ID identifies every chunk in its manifest.
+The current `get_file_id()` helper computes a 32-byte SHA-256 digest of the complete file. This file ID identifies all chunks in its FILE_LIST manifest.
 
 ### CHUNK_DATA (type 7)
 
@@ -134,7 +134,7 @@ remaining bytes: fragment_data
 
 The metadata is 44 bytes. `fragment_offset` is the byte offset within the chunk. `total_chunk_size` is the size of the whole chunk and is repeated in every fragment. `fragment_data` contains only the bytes carried by this fragment; there is no padding.
 
-The local test constructs a pretend 1,000-byte chunk, makes two 500-byte fragments, parses them, and reassembles them. Before integration, reassembly should also check that all fragments have the same `file_id` and `chunk_index`.
+The current live implementation sends fragments of at most 960 bytes and validates that the fragment set has no gaps or conflicting overlaps before storing the complete chunk. Chunks are kept under `peer_chunks/<file_id>/<chunk_index>.chunk`.
 
 ### NEW_PEER (type 11) - proposed
 
@@ -146,9 +146,25 @@ uint16 peer_id | 4-byte IPv4 address | uint16 UDP port
 
 This corresponds to the text prototype message `new_peer:<id>,<ip>,<port>`. The binary encoder and parser are not implemented yet.
 
-### FILE_LIST (type 8) and REPLICATE_REQ (type 10)
+### FILE_LIST (type 8)
 
-Their payloads are not defined yet. Decide the fields and lengths before adding encoders. A file-list entry will need, at minimum, an agreed way to represent file identity and file name/size. A replication request will need to identify the file/chunk and the requested replication action or destination.
+Payload:
+
+```text
+uint16 file_count
+file_count repetitions of:
+    32-byte file_id (SHA-256 of complete file)
+    uint64 file_size
+    uint32 chunk_size
+    uint16 filename_byte_length
+    filename_byte_length bytes of UTF-8 filename
+```
+
+The live sender currently sends one record per datagram so each packet fits the 1,024-byte limit. An empty list uses count zero. The metadata catalog is in memory and each record describes fixed-size chunks.
+
+### REPLICATE_REQ (type 10)
+
+Payload is 32-byte `file_id` plus `uint32 chunk_index`. The sender assigns the chunk to the destination peer. The destination then sends CHUNK_REQUEST back to the sender and stores the returned CHUNK_DATA fragments before announcing ownership with CHUNK_HAVE.
 
 ## 5. Reliability and ordering
 
@@ -160,13 +176,13 @@ Proposed exact-ACK behavior for version 1:
 2. The receiver checks the sequence number and sends an ACK whose `ack_no` equals that packet's sequence number.
 3. The sender retransmits a packet if its ACK does not arrive before a timeout.
 4. The receiver ignores duplicate packets for delivery but sends the ACK again.
-5. For ordered chat delivery, the receiver buffers later chat events until missing earlier chat events arrive, then delivers each event once and in order.
+5. For ordered chat delivery, the receiver accepts only the next expected sequence. It discards a future sequence without ACK; the stop-and-wait sender retries the missing packet before advancing.
 
 Still to specify: initial sequence numbers, wraparound behavior, retry timeout/count, which packet types require ACKs, maximum outstanding packets, and what happens when retries are exhausted. Header sequence numbers wrap in the 16-bit range; sequence comparison rules must account for that.
 
 ## 6. Message flows
 
-These flows describe the current text prototype and the intended binary equivalent. The binary flows still need implementation and final specification.
+Membership currently uses text messages. Chat and file exchange use the binary protocol messages described here.
 
 ### Join
 
@@ -176,7 +192,7 @@ These flows describe the current text prototype and the intended binary equivale
 4. The bootstrap peer informs existing peers about the newcomer using NEW_PEER.
 5. The newcomer adds the peer entries from JOIN_ACK.
 
-Current status: this works using text messages in `p2p_file.py`. The binary JOIN_ACK encoder is in the pasted protocol prototype; binary JOIN/ACK parsing and binary NEW_PEER handling remain to be completed.
+Current status: this works using text messages in `p2p_file.py`; the defined binary JOIN packet types are not wired into live membership yet.
 
 ### Heartbeat and failure detection
 
@@ -186,15 +202,15 @@ Current status: this works using text messages in `p2p_file.py`. The binary JOIN
 
 ### Chat
 
-Intended flow: sender creates a chat event, assigns its sender-wide chat sequence, sends a datagram to each active peer, retransmits unacknowledged packets, and each receiver suppresses duplicates and delivers messages in order.
+Current flow: sender creates a chat event, sends one packet at a time to each peer, retries the same packet until its exact ACK arrives, and receiver suppresses recognized duplicates and accepts messages in order.
 
-Current status: only CHAT payload encoding/parsing is prototyped. Sending chat through the live P2P program and reliable ordered delivery are not implemented.
+Current status: binary CHAT and ACK are used by the live P2P program with per-peer stop-and-wait, exact ACKs, retransmission, duplicate suppression, and ordered acceptance.
 
 ### File transfer
 
-Intended flow: requester identifies a file/chunk, requests it from one or more peers, receives CHUNK_DATA fragments, ACKs reliable packets, reassembles chunks, and verifies the completed file using its SHA-256 file ID.
+Current basic flow: after at least four peers join, `/index <path>` hashes a file, divides it into 256 KiB chunks, balances two owners per chunk, advertises metadata/ownership, and sends REPLICATE_REQ to remote owners. A destination requests its chunk, reassembles CHUNK_DATA, stores it, and announces CHUNK_HAVE. The source removes its temporary chunk copy after both assigned peers report ownership. A requester uses `/download <file_id_hex> [output_path]`; it fetches chunks in parallel batches of up to four, sends each request up to three times before trying another advertised owner, rebuilds the file, and verifies its SHA-256 against the file ID.
 
-Current status: CHUNK_REQUEST, CHUNK_HAVE, CHUNK_DATA helpers and a local fragment-reassembly demonstration exist. Live file advertisement, chunk storage, replication, download scheduling, retransmission, and full-file verification are not implemented.
+Limitations: placement runs only when `/index` is issued and needs four peers and at least two chunks. If replication fails, the source retains temporary chunk copies. Automatic re-replication after peer loss, fragment-level ACKs, and live verification still need work.
 
 ## 7. Current implementation inventory
 
@@ -204,6 +220,8 @@ Current status: CHUNK_REQUEST, CHUNK_HAVE, CHUNK_DATA helpers and a local fragme
 - Payload encoders for CHAT, CHUNK_REQUEST, ACK, JOIN_ACK, CHUNK_DATA, and CHUNK_HAVE.
 - Partial parsing for CHAT, CHUNK_REQUEST, CHUNK_HAVE, and CHUNK_DATA.
 - File SHA-256 helper and a local two-fragment CHUNK_DATA reassembly demonstration.
+- In-memory FILE_LIST/CHUNK_HAVE catalog exchange, REPLICATE_REQ placement, and on-disk chunk store.
+- Basic live CHUNK_REQUEST/CHUNK_DATA transfer, parallel batches of four download chunks, request retries, and whole-file SHA-256 verification.
 - Separate text-based UDP peer discovery with JOIN, JOIN_ACK, NEW_PEER, HEARTBEAT, LEAVE, and timeout removal.
 - Local screenshots show three-peer discovery, heartbeat/timeout behavior, and graceful leave behavior.
 
@@ -212,21 +230,20 @@ Current status: CHUNK_REQUEST, CHUNK_HAVE, CHUNK_DATA helpers and a local fragme
 - Binary packet transport is not wired into `p2p_file.py`; it still uses text messages for peer membership.
 - Binary NEW_PEER encoder/parser and `make_datagram()` support are missing.
 - JOIN_ACK and ACK parsing are missing.
-- FILE_LIST and REPLICATE_REQ payload formats and encoders/decoders are missing.
-- `check_datagram()` prints most decoded values rather than returning a complete parsed packet.
-- Checksum calculation/validation and flags/group semantics are pending.
-- Reliable chat, actual file transfer, storage redundancy, multi-source downloading, and failure recovery are pending.
+- `check_datagram()` returns decoded payload values for the file-transfer and chat packets; other control packet results still need consistent handling.
+- Flags, group semantics, complete packet-level reliability, automatic re-replication after peer loss, and replica failover remain pending.
+- Binary membership messages are specified but the live membership exchange remains text-based.
 
-## 8. Readiness checklist before binary integration
+## 8. Remaining protocol and project checklist
 
 - [ ] Agree and document every header field's semantics, including checksum, flags, group ID, ACK behavior, and sequence wraparound.
 - [ ] Confirm broadcast ID 65535 and define ID 0.
-- [ ] Complete the packet registry and every packet's payload format, including FILE_LIST, REPLICATE_REQ, and NEW_PEER.
+- [ ] Complete binary membership integration for JOIN, JOIN_ACK, NEW_PEER, LEAVE, and HEARTBEAT.
 - [ ] Document complete JOIN, CHAT, file-transfer, LEAVE, and HEARTBEAT message flows.
 - [ ] Implement encoders and parsers for every packet type that version 1 supports.
 - [ ] Make the parser validate lengths and return structured header/payload data.
 - [ ] Add a round-trip test vector for every packet type and malformed-packet checks.
-- [ ] Integrate binary JOIN and JOIN_ACK into `p2p_file.py` first; then migrate the remaining messages one type at a time.
+- [ ] Run the file placement/download flow with four peers, including a stopped chunk source, and record results.
 
 ## 9. Versioning rule
 
