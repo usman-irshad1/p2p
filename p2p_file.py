@@ -5,17 +5,29 @@ import random
 import sys
 import time
 import struct
+import os
 from collections import deque
 import protocol_design
+import file_catalog as file_catalog_helpers
+import chunk_store
 
 messages = queue.Queue()
 peers = []
 last_seen = {}
+bootstrap_addr = None
 peer_lock = threading.Lock()
 sequence_lock = threading.Lock()
 chat_state_lock = threading.Lock()
+file_catalog_lock = threading.RLock()
+chunk_download_lock = threading.Lock()
 outgoing_chat_queues = {}
 pending_chats = {}
+file_catalog_state = file_catalog_helpers.create_catalog()
+pending_chunk_have = set()
+pending_chunk_downloads = {}
+pending_replication_requests = set()
+active_replication_tasks = set()
+chunk_placement_state = {}
 
 PACKET_SEQUENCE_MAX = 0xFFFF
 CHAT_SEQUENCE_MAX = 0xFFFFFFFF
@@ -28,6 +40,19 @@ received_chat_pairs_by_peer = {}
 HEARTBEAT_INTERVAL = 5
 PEER_TIMEOUT = 15
 CHAT_RETRY_INTERVAL = 1
+DEFAULT_CHUNK_SIZE = 256 * 1024
+CHUNK_STORE_DIR = os.path.join(os.path.dirname(__file__), "peer_chunks")
+CHUNK_FRAGMENT_DATA_SIZE = (
+    protocol_design.MAX_DATAGRAM_SIZE - protocol_design.header_size - 44
+)
+CHUNK_REQUEST_TIMEOUT = 5
+MIN_DISTRIBUTION_PEERS = 4
+MAX_FILE_LIST_FILENAME_BYTES = (
+    protocol_design.MAX_DATAGRAM_SIZE
+    - protocol_design.header_size
+    - struct.calcsize("!H")
+    - struct.calcsize("!32sQIH")
+)
 
 
 def peer_snapshot():
@@ -63,6 +88,11 @@ def remove_peer(peer_id, peer_addr=None):
         last_seen.pop(peer_id, None)
         clear_peer_sequence_state(peer_id)
         clear_pending_chat(peer_id)
+        with file_catalog_lock:
+            file_catalog_helpers.remove_peer(file_catalog_state, peer_id)
+            pending_chunk_have.difference_update({
+                item for item in pending_chunk_have if item[2] == peer_id
+            })
 
     return removed
 
@@ -169,6 +199,445 @@ def send_chat_to_active_peers(chat_datagram):
     return recipients
 
 
+def send_file_catalog_to_peer(destination_id, destination_addr):
+    """Send known file metadata and this peer's chunk claims to one peer."""
+    with file_catalog_lock:
+        records = file_catalog_helpers.file_list_records(file_catalog_state)
+        local_chunks = [
+            (file_id, chunk_index)
+            for file_id, metadata in file_catalog_state.items()
+            for chunk_index, owners in metadata["chunk_owners"].items()
+            if peer_id in owners
+        ]
+
+    if not records:
+        records_to_send = [()]
+    else:
+        # FILE_LIST has no fragmentation yet; one record per UDP datagram keeps
+        # each message within the current 1,024-byte receive limit.
+        records_to_send = [(record,) for record in records]
+
+    for file_records in records_to_send:
+        datagram = protocol_design.make_datagram(
+            packet_name="FILE_LIST",
+            peer_id=peer_id,
+            destination_p_id=destination_id,
+            protocol_version=protocol_design.PROTOCOL_VERSION,
+            flags=0,
+            group_id=0,
+            seq_no=0,
+            payload=file_records,
+        )
+        if len(datagram) > protocol_design.MAX_DATAGRAM_SIZE:
+            raise ValueError("A FILE_LIST record exceeds the 1,024-byte limit")
+        server.sendto(datagram, destination_addr)
+
+    for file_id, chunk_index in local_chunks:
+        datagram = protocol_design.make_datagram(
+            packet_name="CHUNK_HAVE",
+            peer_id=peer_id,
+            destination_p_id=destination_id,
+            protocol_version=protocol_design.PROTOCOL_VERSION,
+            flags=0,
+            group_id=0,
+            seq_no=0,
+            payload=(file_id, chunk_index),
+        )
+        server.sendto(datagram, destination_addr)
+
+
+def broadcast_file_catalog():
+    """Send this peer's catalog and local chunk claims to every active peer."""
+    for destination_id, destination_addr in peer_snapshot():
+        send_file_catalog_to_peer(destination_id, destination_addr)
+
+
+def plan_chunk_owners(chunk_count, participant_ids):
+    """Assign two balanced, distinct peer owners to each chunk."""
+    participant_ids = tuple(sorted(set(participant_ids)))
+    if len(participant_ids) < 2:
+        raise ValueError("At least two peers are required for replication")
+
+    load_by_peer = {known_id: 0 for known_id in participant_ids}
+    placement = {}
+    peer_count = len(participant_ids)
+
+    for chunk_index in range(chunk_count):
+        tie_order = {
+            known_id: (position - chunk_index) % peer_count
+            for position, known_id in enumerate(participant_ids)
+        }
+        ranked = sorted(
+            participant_ids,
+            key=lambda known_id: (load_by_peer[known_id], tie_order[known_id]),
+        )
+        owners = tuple(ranked[:2])
+        placement[chunk_index] = owners
+        for owner_id in owners:
+            load_by_peer[owner_id] += 1
+
+    return placement
+
+
+def distribute_file_chunks(file_id):
+    """Assign two owners, advertise the file, then ask owners to copy chunks."""
+    with file_catalog_lock:
+        metadata = file_catalog_state.get(file_id)
+        if metadata is None:
+            raise ValueError("File metadata is not in the catalog")
+        chunk_count = metadata["chunk_count"]
+
+    participants = {peer_id}
+    participants.update(known_id for known_id, _ in peer_snapshot())
+    participants = tuple(sorted(participants))
+    placement = {}
+    if len(participants) >= MIN_DISTRIBUTION_PEERS and chunk_count >= 2:
+        placement = plan_chunk_owners(chunk_count, participants)
+
+    with file_catalog_lock:
+        metadata = file_catalog_state[file_id]
+        for chunk_index, owners in metadata["chunk_owners"].items():
+            owners.discard(peer_id)
+            if placement:
+                if peer_id in placement[chunk_index]:
+                    owners.add(peer_id)
+            else:
+                owners.add(peer_id)
+        chunk_placement_state[file_id] = placement
+
+    broadcast_file_catalog()
+
+    if not placement:
+        return 0
+
+    peer_addresses = dict(peer_snapshot())
+    requests_sent = 0
+    for chunk_index, owners in placement.items():
+        for owner_id in owners:
+            if owner_id == peer_id:
+                continue
+            owner_addr = peer_addresses.get(owner_id)
+            if owner_addr is None:
+                continue
+            request_datagram = protocol_design.make_datagram(
+                packet_name="REPLICATE_REQ",
+                peer_id=peer_id,
+                destination_p_id=owner_id,
+                protocol_version=protocol_design.PROTOCOL_VERSION,
+                flags=0,
+                group_id=0,
+                seq_no=0,
+                payload=(file_id, chunk_index),
+            )
+            server.sendto(request_datagram, owner_addr)
+            requests_sent += 1
+
+    return requests_sent
+
+
+def register_file_metadata(file_path):
+    """Index a file, save its chunks locally, and announce their availability."""
+    filename = os.path.basename(os.fspath(file_path))
+    if len(filename.encode("utf-8")) > MAX_FILE_LIST_FILENAME_BYTES:
+        raise ValueError(
+            "Filename is too long for the current FILE_LIST datagram limit"
+        )
+
+    with file_catalog_lock:
+        file_id = file_catalog_helpers.register_file(
+            file_catalog_state,
+            file_path,
+            DEFAULT_CHUNK_SIZE,
+        )
+        metadata = file_catalog_state[file_id].copy()
+
+    chunk_indices = chunk_store.split_and_store_file(
+        file_path,
+        CHUNK_STORE_DIR,
+        file_id,
+        metadata["chunk_size"],
+    )
+    requests_sent = distribute_file_chunks(file_id)
+    return file_id, metadata, len(chunk_indices), requests_sent
+
+
+def send_chunk_data(destination_id, destination_addr, file_id, chunk_index):
+    """Send one locally stored chunk as protocol-sized CHUNK_DATA fragments."""
+    chunk_data = chunk_store.load_chunk(
+        CHUNK_STORE_DIR,
+        file_id,
+        chunk_index,
+    )
+    total_chunk_size = len(chunk_data)
+
+    for fragment_offset in range(0, total_chunk_size, CHUNK_FRAGMENT_DATA_SIZE):
+        fragment_data = chunk_data[
+            fragment_offset:fragment_offset + CHUNK_FRAGMENT_DATA_SIZE
+        ]
+        datagram = protocol_design.make_datagram(
+            packet_name="CHUNK_DATA",
+            peer_id=peer_id,
+            destination_p_id=destination_id,
+            protocol_version=protocol_design.PROTOCOL_VERSION,
+            flags=0,
+            group_id=0,
+            seq_no=(fragment_offset // CHUNK_FRAGMENT_DATA_SIZE) & 0xFFFF,
+            payload=(
+                file_id,
+                chunk_index,
+                fragment_offset,
+                total_chunk_size,
+                fragment_data,
+            ),
+        )
+        server.sendto(datagram, destination_addr)
+
+
+def request_chunk(file_id, chunk_index, preferred_owner_id=None, preferred_addr=None):
+    """Request a chunk from known owners, trying another peer after timeout."""
+    with file_catalog_lock:
+        metadata = file_catalog_state.get(file_id)
+        if metadata is None:
+            raise ValueError("File metadata is not in the catalog")
+        if chunk_index not in metadata["chunk_owners"]:
+            raise ValueError("Chunk index is outside the file")
+        owners = tuple(sorted(metadata["chunk_owners"][chunk_index]))
+        file_size = metadata["file_size"]
+        chunk_size = metadata["chunk_size"]
+
+    if chunk_store.has_chunk(CHUNK_STORE_DIR, file_id, chunk_index):
+        if preferred_owner_id is not None:
+            announce_chunk_have(file_id, chunk_index)
+        return True
+
+    expected_size = min(
+        chunk_size,
+        max(0, file_size - chunk_index * chunk_size),
+    )
+    if expected_size == 0:
+        raise ValueError("The requested chunk has no data")
+
+    peer_addresses = dict(peer_snapshot())
+    if preferred_owner_id is not None:
+        owners = (preferred_owner_id,)
+        if peer_addresses.get(preferred_owner_id) != preferred_addr:
+            raise ValueError("Replication request came from an unknown peer")
+    elif owners:
+        start = chunk_index % len(owners)
+        owners = owners[start:] + owners[:start]
+    for owner_id in owners:
+        if owner_id == peer_id or owner_id not in peer_addresses:
+            continue
+
+        owner_addr = peer_addresses[owner_id]
+        event = threading.Event()
+        key = (file_id, chunk_index)
+        download_state = {
+            "owner_id": owner_id,
+            "owner_addr": owner_addr,
+            "expected_size": expected_size,
+            "total_size": None,
+            "fragments": {},
+            "event": event,
+            "error": None,
+        }
+
+        with chunk_download_lock:
+            if key in pending_chunk_downloads:
+                raise ValueError("This chunk is already being downloaded")
+            pending_chunk_downloads[key] = download_state
+
+        try:
+            request_datagram = protocol_design.make_datagram(
+                packet_name="CHUNK_REQUEST",
+                peer_id=peer_id,
+                destination_p_id=owner_id,
+                protocol_version=protocol_design.PROTOCOL_VERSION,
+                flags=0,
+                group_id=0,
+                seq_no=0,
+                payload=(file_id, chunk_index),
+            )
+            for attempt in range(3):
+                server.sendto(request_datagram, owner_addr)
+                if event.wait(CHUNK_REQUEST_TIMEOUT / 3):
+                    if download_state["error"] is None:
+                        announce_chunk_have(file_id, chunk_index)
+                        return True
+                    break
+        finally:
+            with chunk_download_lock:
+                pending_chunk_downloads.pop(key, None)
+
+    raise TimeoutError(
+        f"No peer delivered chunk {chunk_index} of {file_id.hex()[:8]}"
+    )
+
+
+def replicate_chunk_from_peer(file_id, chunk_index, owner_id, owner_addr):
+    """Fetch one assigned replica from the peer that requested replication."""
+    task_key = (file_id, chunk_index, owner_id)
+    try:
+        request_chunk(file_id, chunk_index, owner_id, owner_addr)
+    except (OSError, ValueError, TimeoutError) as error:
+        print(f"Chunk replica {chunk_index} failed: {error}")
+    finally:
+        with chunk_download_lock:
+            active_replication_tasks.discard(task_key)
+
+
+def start_replication_request(file_id, chunk_index, owner_id, owner_addr):
+    """Start a requested replica transfer once file metadata is available."""
+    with file_catalog_lock:
+        if file_id not in file_catalog_state:
+            pending_replication_requests.add(
+                (file_id, chunk_index, owner_id, owner_addr)
+            )
+            return
+
+    task_key = (file_id, chunk_index, owner_id)
+    with chunk_download_lock:
+        if task_key in active_replication_tasks:
+            return
+        active_replication_tasks.add(task_key)
+
+    threading.Thread(
+        target=replicate_chunk_from_peer,
+        args=(file_id, chunk_index, owner_id, owner_addr),
+        daemon=True,
+    ).start()
+
+
+def maybe_release_staged_chunk(file_id, chunk_index):
+    """Drop a temporary source copy after all assigned replicas report ready."""
+    placement = chunk_placement_state.get(file_id)
+    if not placement or chunk_index not in placement:
+        return False
+
+    expected_owners = set(placement[chunk_index])
+    if peer_id in expected_owners:
+        return False
+
+    with file_catalog_lock:
+        actual_owners = file_catalog_state[file_id]["chunk_owners"][chunk_index]
+        all_replicas_reported = expected_owners.issubset(actual_owners)
+
+    if all_replicas_reported:
+        return chunk_store.delete_chunk(CHUNK_STORE_DIR, file_id, chunk_index)
+    return False
+
+
+def download_one_chunk(file_id, chunk_index, errors):
+    """Worker used by download_file to fetch one chunk independently."""
+    try:
+        request_chunk(file_id, chunk_index)
+    except Exception as error:
+        errors[chunk_index] = str(error)
+
+
+def download_file(file_id, destination_path):
+    """Fetch chunks in parallel, rebuild the file, and verify its SHA-256 ID."""
+    with file_catalog_lock:
+        metadata = file_catalog_state.get(file_id)
+        if metadata is None:
+            raise ValueError("File ID is not in the catalog")
+        chunk_count = metadata["chunk_count"]
+        filename = metadata["filename"]
+
+    if not destination_path:
+        destination_path = os.path.join("downloads", filename)
+
+    errors = {}
+    # Limit each batch to four concurrent chunk downloads.
+    for batch_start in range(0, chunk_count, 4):
+        batch_end = min(batch_start + 4, chunk_count)
+        workers = [
+            threading.Thread(
+                target=download_one_chunk,
+                args=(file_id, chunk_index, errors),
+            )
+            for chunk_index in range(batch_start, batch_end)
+            if not chunk_store.has_chunk(
+                CHUNK_STORE_DIR, file_id, chunk_index
+            )
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+
+        if errors:
+            chunk_index = min(errors)
+            raise TimeoutError(
+                f"Could not download chunk {chunk_index}: {errors[chunk_index]}"
+            )
+
+    return chunk_store.assemble_file(
+        CHUNK_STORE_DIR,
+        file_id,
+        chunk_count,
+        destination_path,
+    )
+
+
+def announce_chunk_have(file_id, chunk_index):
+    """Announce a chunk after the local peer has actually stored its bytes."""
+    with file_catalog_lock:
+        file_catalog_helpers.add_chunk_owner(
+            file_catalog_state,
+            file_id,
+            chunk_index,
+            peer_id,
+        )
+
+    recipients = peer_snapshot()
+    for destination_id, destination_addr in recipients:
+        datagram = protocol_design.make_datagram(
+            packet_name="CHUNK_HAVE",
+            peer_id=peer_id,
+            destination_p_id=destination_id,
+            protocol_version=protocol_design.PROTOCOL_VERSION,
+            flags=0,
+            group_id=0,
+            seq_no=0,
+            payload=(file_id, chunk_index),
+        )
+        server.sendto(datagram, destination_addr)
+    return len(recipients)
+
+
+def show_file_catalog():
+    """Print indexed files and the known peer owners for each chunk."""
+    with file_catalog_lock:
+        records = file_catalog_helpers.file_list_records(file_catalog_state)
+        details = [
+            (
+                file_id,
+                metadata["file_size"],
+                metadata["chunk_size"],
+                metadata["chunk_count"],
+                {
+                    index: tuple(sorted(owners))
+                    for index, owners in metadata["chunk_owners"].items()
+                },
+            )
+            for file_id, metadata in file_catalog_state.items()
+        ]
+
+    if not records:
+        print("File catalog is empty.")
+        return
+
+    for file_id, file_size, chunk_size, filename in records:
+        entry = next(item for item in details if item[0] == file_id)
+        print(
+            f"{filename}: {file_size} bytes, {entry[3]} chunks "
+            f"({chunk_size} bytes per chunk), file_id={file_id.hex()}"
+        )
+        for chunk_index, owners in entry[4].items():
+            print(f"  chunk {chunk_index}: peers {owners}")
+
+
 def queue_group_chat(text):
     """Queue this chat separately for every peer currently in the group."""
     # Validate the UTF-8 byte limit before placing the message in any queue.
@@ -244,16 +713,64 @@ def chat_sender():
 
 
 def chat_input():
-    """Read chat lines from the terminal and queue them for active peers."""
+    """Read chat lines and the small file-catalog commands from the terminal."""
     while True:
         try:
             text = input()
-            if text:
+            if text == "/files":
+                show_file_catalog()
+            elif text.startswith("/index "):
+                file_path = text[len("/index "):].strip()
+                if len(file_path) >= 2 and file_path[0] == file_path[-1] == '"':
+                    file_path = file_path[1:-1]
+                file_id, metadata, stored_count, replicas_requested = (
+                    register_file_metadata(file_path)
+                )
+                print(
+                    f"Stored {stored_count} chunks for {metadata['filename']} "
+                    f"(file ID {file_id.hex()})."
+                )
+                if replicas_requested:
+                    print(f"Requested {replicas_requested} remote chunk copies.")
+                else:
+                    print(
+                        "Distributed replication needs at least four joined peers "
+                        "and a file with at least two chunks."
+                    )
+            elif text.startswith("/download "):
+                command_parts = text.split(maxsplit=2)
+                if len(command_parts) < 2:
+                    raise ValueError("Usage: /download FILE_ID_HEX [output_path]")
+                file_id = bytes.fromhex(command_parts[1])
+                if len(file_id) != 32:
+                    raise ValueError("FILE_ID_HEX must contain 64 hex characters")
+                destination = command_parts[2] if len(command_parts) == 3 else None
+                if (
+                    destination
+                    and len(destination) >= 2
+                    and destination[0] == destination[-1] == '"'
+                ):
+                    destination = destination[1:-1]
+                threading.Thread(
+                    target=download_file_from_command,
+                    args=(file_id, destination),
+                    daemon=True,
+                ).start()
+            elif text:
                 queue_group_chat(text)
-        except (ValueError, UnicodeError) as error:
-            print(f"Cannot queue chat message: {error}")
+        except (OSError, ValueError, UnicodeError) as error:
+            print(f"Cannot process input: {error}")
         except EOFError:
             return
+
+
+def download_file_from_command(file_id, destination_path):
+    """Run the download outside the terminal input loop and report its result."""
+    try:
+        saved_path = download_file(file_id, destination_path)
+        print(f"Downloaded and verified file: {saved_path}")
+    except (OSError, ValueError, TimeoutError) as error:
+        print(f"Download failed: {error}")
 
 
 def receive():
@@ -401,12 +918,231 @@ def handle_protocol_chat_or_ack(message, addr):
     return True
 
 
+def handle_protocol_catalog(message, addr):
+    """Process FILE_LIST metadata and CHUNK_HAVE ownership announcements."""
+    if len(message) < protocol_design.header_size:
+        return False
+
+    packet_type = message[4]
+    file_list_type = protocol_design.get_packet_type("FILE_LIST")
+    chunk_have_type = protocol_design.get_packet_type("CHUNK_HAVE")
+    if packet_type not in (file_list_type, chunk_have_type):
+        return False
+
+    try:
+        fields = struct.unpack(
+            protocol_design.HEADER_FORMAT,
+            message[:protocol_design.header_size],
+        )
+        sender_id, destination_id = fields[0], fields[1]
+
+        if packet_type == file_list_type:
+            file_records = protocol_design.check_datagram(message, show_output=False)
+        else:
+            file_id, chunk_index = protocol_design.check_datagram(
+                message, show_output=False
+            )
+
+        if destination_id != peer_id:
+            return True
+
+        known_sender = any(
+            known_id == sender_id and known_addr == addr
+            for known_id, known_addr in peer_snapshot()
+        )
+        if not known_sender and bootstrap_addr == addr:
+            add_peer(sender_id, addr)
+            last_seen[sender_id] = time.monotonic()
+            known_sender = True
+        if not known_sender:
+            return True
+
+        if packet_type == file_list_type:
+            learned_owners = []
+            ready_replications = []
+            with file_catalog_lock:
+                file_catalog_helpers.merge_file_list(file_catalog_state, file_records)
+                for pending_item in tuple(pending_chunk_have):
+                    pending_file_id, pending_index, owner_id = pending_item
+                    if pending_file_id in file_catalog_state:
+                        try:
+                            is_new = file_catalog_helpers.add_chunk_owner(
+                                file_catalog_state,
+                                pending_file_id,
+                                pending_index,
+                                owner_id,
+                            )
+                            if is_new:
+                                learned_owners.append(pending_item)
+                        except ValueError:
+                            pass
+                        pending_chunk_have.discard(pending_item)
+
+                for pending_request in tuple(pending_replication_requests):
+                    pending_file_id, pending_index, owner_id, owner_addr = pending_request
+                    if pending_file_id in file_catalog_state:
+                        ready_replications.append(pending_request)
+                        pending_replication_requests.discard(pending_request)
+
+            print(
+                f"Received FILE_LIST from peer {sender_id}: "
+                f"{len(file_records)} file record(s)"
+            )
+            for learned_file_id, learned_index, owner_id in learned_owners:
+                print(
+                    f"Learned chunk {learned_index} of "
+                    f"{learned_file_id.hex()[:8]} from peer {owner_id}"
+                )
+            for pending_file_id, pending_index, owner_id, owner_addr in ready_replications:
+                start_replication_request(
+                    pending_file_id,
+                    pending_index,
+                    owner_id,
+                    owner_addr,
+                )
+        else:
+            with file_catalog_lock:
+                if file_id in file_catalog_state:
+                    is_new = file_catalog_helpers.add_chunk_owner(
+                        file_catalog_state,
+                        file_id,
+                        chunk_index,
+                        sender_id,
+                    )
+                else:
+                    pending_chunk_have.add((file_id, chunk_index, sender_id))
+                    is_new = False
+
+            if is_new:
+                print(
+                    f"Learned chunk {chunk_index} of {file_id.hex()[:8]} "
+                    f"from peer {sender_id}"
+                )
+                maybe_release_staged_chunk(file_id, chunk_index)
+
+    except (ValueError, UnicodeDecodeError, KeyError) as error:
+        print(f"Ignoring invalid catalog packet from {addr}: {error}")
+
+    return True
+
+
+def handle_chunk_transfer(message, addr):
+    """Serve CHUNK_REQUEST or collect a requested CHUNK_DATA fragment."""
+    if len(message) < protocol_design.header_size:
+        return False
+
+    packet_type = message[4]
+    request_type = protocol_design.get_packet_type("CHUNK_REQUEST")
+    data_type = protocol_design.get_packet_type("CHUNK_DATA")
+    replication_type = protocol_design.get_packet_type("REPLICATE_REQ")
+    if packet_type not in (request_type, data_type, replication_type):
+        return False
+
+    try:
+        fields = struct.unpack(
+            protocol_design.HEADER_FORMAT,
+            message[:protocol_design.header_size],
+        )
+        sender_id, destination_id = fields[0], fields[1]
+        if destination_id != peer_id:
+            return True
+
+        known_sender = any(
+            known_id == sender_id and known_addr == addr
+            for known_id, known_addr in peer_snapshot()
+        )
+        if not known_sender:
+            return True
+
+        if packet_type == replication_type:
+            file_id, chunk_index = protocol_design.check_datagram(
+                message,
+                show_output=False,
+            )
+            start_replication_request(
+                file_id,
+                chunk_index,
+                sender_id,
+                addr,
+            )
+            return True
+
+        if packet_type == request_type:
+            file_id, chunk_index = protocol_design.check_datagram(
+                message,
+                show_output=False,
+            )
+            if chunk_store.has_chunk(CHUNK_STORE_DIR, file_id, chunk_index):
+                send_chunk_data(sender_id, addr, file_id, chunk_index)
+            return True
+
+        file_id, chunk_index, fragment_offset, total_chunk_size, fragment_data = (
+            protocol_design.check_datagram(message, show_output=False)
+        )
+        key = (file_id, chunk_index)
+        with chunk_download_lock:
+            state = pending_chunk_downloads.get(key)
+            if (
+                state is None
+                or state["owner_id"] != sender_id
+                or state["owner_addr"] != addr
+            ):
+                return True
+
+            if total_chunk_size != state["expected_size"]:
+                state["error"] = "Peer sent a chunk with the wrong size"
+                state["event"].set()
+                return True
+
+            if state["total_size"] not in (None, total_chunk_size):
+                state["error"] = "Fragments disagree about total chunk size"
+                state["event"].set()
+                return True
+
+            state["total_size"] = total_chunk_size
+            prior_data = state["fragments"].get(fragment_offset)
+            if prior_data is not None and prior_data != fragment_data:
+                state["error"] = "Conflicting duplicate fragment"
+                state["event"].set()
+                return True
+            state["fragments"][fragment_offset] = fragment_data
+
+            expected_offset = 0
+            ordered_fragments = []
+            for offset, data in sorted(state["fragments"].items()):
+                if offset != expected_offset:
+                    return True
+                ordered_fragments.append(
+                    (file_id, chunk_index, offset, total_chunk_size, data)
+                )
+                expected_offset += len(data)
+
+            if expected_offset == total_chunk_size:
+                rebuilt_chunk = protocol_design.reassemble_chunk(ordered_fragments)
+                chunk_store.store_chunk(
+                    CHUNK_STORE_DIR,
+                    file_id,
+                    chunk_index,
+                    rebuilt_chunk,
+                )
+                state["event"].set()
+
+    except (OSError, ValueError, UnicodeDecodeError) as error:
+        print(f"Ignoring invalid chunk packet from {addr}: {error}")
+
+    return True
+
+
 def broadcast():
     while True:
         message, addr = messages.get()
 
         try:
             if handle_protocol_chat_or_ack(message, addr):
+                continue
+            if handle_chunk_transfer(message, addr):
+                continue
+            if handle_protocol_catalog(message, addr):
                 continue
 
             text = message.decode("utf-8")
@@ -419,6 +1155,7 @@ def broadcast():
                     last_seen[joining_id] = time.monotonic()
 
                 join_ack(addr, joining_id)
+                send_file_catalog_to_peer(joining_id, addr)
 
                 outgoing = (
                     f"new_peer:{joining_id},{addr[0]},{addr[1]}"
@@ -443,6 +1180,7 @@ def broadcast():
                             last_seen[known_id] = time.monotonic()
 
                 print("Updated peer list:", peer_snapshot())
+                broadcast_file_catalog()
 
             elif text.startswith("new_peer:"):
                 peer_info = text.split(":", 1)[1]
@@ -451,8 +1189,10 @@ def broadcast():
                 known_id = int(known_id_text)
                 known_addr = (known_ip, int(known_port_text))
 
-                if known_id != peer_id and add_peer(known_id, known_addr):
+                added = known_id != peer_id and add_peer(known_id, known_addr)
+                if added:
                     last_seen[known_id] = time.monotonic()
+                    send_file_catalog_to_peer(known_id, known_addr)
 
                 print("Updated peer list:", peer_snapshot())
 
@@ -540,8 +1280,6 @@ def main():
 
     advertise_ip = "127.0.0.1"
 
-    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    server.bind(("0.0.0.0", local_port))
     server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     server.bind(("0.0.0.0", local_port))
 
