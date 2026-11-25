@@ -4,7 +4,7 @@ A student project to build a multi-peer group chat and file-sharing application 
 
 ## Project status
 
-**Status:** The fixed code in `p2p_fixed.zip` is applied. The supplied unit and four-peer localhost integration checks passed on 25 Nov 2026; LAN interoperability and packet-loss simulation remain unverified.
+**Status:** The supplied unit suite passed (17 tests) on 25 Nov 2026. The latest expanded localhost integration run passed the four-peer chat, membership, initial replication, multi-source download, corruption fallback, and simulated source-failure checks, but failed during late-join rebalancing: the fifth peer did not receive every chunk assigned to it. LAN interoperability and broader packet-loss simulation remain unverified.
 
 ### Progress against `protocol_improvements.pdf`
 
@@ -16,7 +16,7 @@ A student project to build a multi-peer group chat and file-sharing application 
 4. [x] Ranged `CHUNK_REQUEST` with resume offsets, `CHUNK_NAK` failover, and per-chunk SHA-256 metadata/checking (`CHUNK_HASH`).
 5. [x] Bootstrap ID assignment, heartbeat membership-view hashes and repair, and bounded HRW placement across at least three peers.
 
-These items are implemented in the current code. See the checklist below for what the integration run demonstrated and what still needs assignment-specific evidence.
+These items are present in the current code. The latest integration run did not verify every behavior end to end; see the checklist below for the late-join failure and remaining assignment checks.
 
 ### Implemented or prototyped
 
@@ -60,14 +60,14 @@ These items are implemented in the current code. See the checklist below for wha
 - [ ] Simulate network packet loss and verify FILE_LIST, CHUNK_HASH, CHUNK_HAVE retries and selective fragment retransmission; save screenshots.
 - [ ] Corrupt a stored chunk/digest and verify hash rejection and fallback to a replica; save screenshots.
 - [ ] Saturate a source's four transfer slots and verify BUSY response plus alternate-owner failover; save screenshots.
-- [x] Run the supplied four-peer localhost integration check: membership, chat, two 2.5 MB files, replica count, and no complete-file owner.
+- [x] Four-peer localhost checks passed for membership, chat, two 2.5 MB files, replica count, and no complete-file owner.
+- [ ] The expanded integration run fails at the fifth-peer late-join check: the joiner does not receive every chunk assigned in the new placement. Logs include `Could not rebalance chunk ... No peer delivered ...`.
 - [ ] Index at least two 2 MB-or-larger files from each participant (the included test indexes two files total).
 - [x] Integration run downloaded a file from multiple source peers and checked its SHA-256.
 - [x] Integration run stopped a source during a download, verified failover and full-file SHA-256, then observed timeout removal and re-replication.
 - [ ] Run the complete demo across four actual participant machines and verify LAN addresses/firewall behavior.
-- [ ] Capture fresh terminal screenshots for the evidence PDF; the automated integration output is not yet in the PDF.
+- [x] Add the latest integration screenshots and captions to [the debugging PDF](evidence/p2p_debug_outputs.pdf), including the late-join rebalance failure and peer logs.
 - [ ] Record performance measurements and graphs for the report.
-- [ ] Finish submission packaging and live demonstration preparation.
 - [ ] Finish submission packaging, run instructions, and live demonstration preparation.
 
 ## Run peer discovery locally
@@ -98,9 +98,9 @@ From the project directory, run:
 python integration_test.py
 ```
 
-The checker runs the unit suite, starts four localhost peers, and indexes two 2.5 MB files from each. It then adds a fifth peer after the catalog is populated, checks that it receives its assigned chunks, and indexes two files from it as well. The run simulates one lost CHUNK_DATA fragment, a BUSY reply, a corrupted replica, and a source crash during download. It verifies overlapping chunk downloads, multi-source reconstruction, timeout removal, and replica repair.
+The checker runs the unit suite, starts four localhost peers, indexes two 2.5 MB files from each, and exercises a lost CHUNK_DATA fragment, BUSY reply, corrupted replica, and source crash during download. In the latest run, the four-peer checks passed, including overlapping multi-source download, reconstruction, timeout removal, and replica repair. The later fifth-peer join/rebalance check failed because the joiner did not receive every chunk assigned to it; fix this before treating the full integration run as passing.
 
-Temporary test stores and files are removed when the checker exits. It chooses five free consecutive UDP ports unless `P2P_TEST_PORT` is set. The run prints localhost timing measurements and saves them to `output/integration_metrics.csv`. It does not verify real LAN/firewall behavior or simulate packet loss for every packet type; those checks still need a multi-machine run and broader loss tests.
+Temporary test stores and files are removed when the checker exits. It chooses free consecutive UDP ports unless `P2P_TEST_PORT` is set. The run prints localhost timing measurements and saves them to `output/integration_metrics.csv`. The latest run failed during late-join rebalancing, so its output is diagnostic evidence rather than a complete pass. It does not verify real LAN/firewall behavior or simulate packet loss for every packet type.
 
 In a peer terminal, share a file and inspect the catalog:
 
@@ -165,7 +165,7 @@ sequenceDiagram
     Note over S,R: If the ACK times out, sender retries the unchanged CHAT
 ```
 
-The supplied unit suite checks Rule 6/7 cases, and the four-peer run verified chat delivery without repeated display. Screenshot evidence for this run still needs to be added.
+The supplied unit suite checks Rule 6/7 cases, and the four-peer run verified chat delivery without repeated display. The latest run screenshots are included in the evidence PDF; the full integration run remains blocked by the late-join rebalance failure described above.
 
 ### File placement and basic download
 
