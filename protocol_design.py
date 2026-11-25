@@ -73,6 +73,10 @@ def check_datagram(datagram, show_output=True):
                 "CHUNK_ACK and CHUNK_NAK require zero header sequence fields"
             )
 
+    if packet_type == 14:
+        if decoded_fields[6] != 0 or decoded_fields[7] != 0:
+            raise ValueError("CHUNK_HASH requires zero header sequence fields")
+
     if compute_checksum(datagram) != decoded_fields[9]:
         raise ValueError("Checksum mismatch")
 
@@ -269,6 +273,17 @@ def check_datagram(datagram, show_output=True):
                 print("CHUNK_ACK bitmap:", f"0x{bitmap:08x}")
             return file_id, chunk_index, cumulative_offset, bitmap
 
+        elif packet_type == 14:  # CHUNK_HASH
+            if len(payload) != 68:
+                raise ValueError("CHUNK_HASH payload must be exactly 68 bytes")
+
+            file_id, chunk_index, chunk_hash = struct.unpack("!32sI32s", payload)
+            if show_output:
+                print("CHUNK_HASH file_id:", file_id.hex())
+                print("CHUNK_HASH chunk_index:", chunk_index)
+                print("CHUNK_HASH digest:", chunk_hash.hex())
+            return file_id, chunk_index, chunk_hash
+
 
 
     else:
@@ -329,6 +344,8 @@ def get_packet_type(packet_name):
         return 12
     elif packet_name == "CHUNK_ACK":
         return 13
+    elif packet_name == "CHUNK_HASH":
+        return 14
     else:
         raise ValueError("Unknown packet type")
 
@@ -524,6 +541,14 @@ def make_payload(payload, packet_type):
             "!32sIII", file_id, chunk_index, cumulative_offset, bitmap
         )
 
+    elif packet_type == 14:  # CHUNK_HASH
+        file_id, chunk_index, chunk_hash = payload
+        if not isinstance(file_id, bytes) or len(file_id) != 32:
+            raise ValueError("file_id must be a 32-byte SHA-256 hash")
+        if not isinstance(chunk_hash, bytes) or len(chunk_hash) != 32:
+            raise ValueError("chunk_hash must be a 32-byte SHA-256 digest")
+        return struct.pack("!32sI32s", file_id, chunk_index, chunk_hash)
+
     else:
         raise NotImplementedError(
             "Payload format not added for this packet type"
@@ -561,6 +586,9 @@ def make_datagram(
         raise ValueError(
             "CHUNK_ACK and CHUNK_NAK require seq_no=0 and ack_no=0"
         )
+
+    if packet_type == 14 and (seq_no != 0 or ack_no != 0):
+        raise ValueError("CHUNK_HASH requires seq_no=0 and ack_no=0")
 
     payload_encoded = make_payload(payload, packet_type)
     datagram = None
@@ -777,6 +805,22 @@ def make_datagram(
         datagram = header_bytes + payload_encoded
 
     if packet_type == 13:  # CHUNK_ACK
+        fields = (
+            peer_id,
+            destination_p_id,
+            packet_type,
+            protocol_version,
+            flags,
+            group_id,
+            seq_no,
+            ack_no,
+            len(payload_encoded),
+            0,
+        )
+        header_bytes = struct.pack(HEADER_FORMAT, *fields)
+        datagram = header_bytes + payload_encoded
+
+    if packet_type == 14:  # CHUNK_HASH
         fields = (
             peer_id,
             destination_p_id,

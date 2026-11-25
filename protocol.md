@@ -6,7 +6,7 @@
 
 This is an application-layer protocol carried in UDP datagrams. Each peer has a UDP socket and can send to and receive from other peers. A bootstrap peer may help a newcomer discover the group, but it is not a permanent server and does not store the group's files centrally.
 
-The current `p2p_file.py` uses text messages for membership (`join:`, `join_ack:`, `new_peer:`, `heartbeat:`, and `leave:`), and binary protocol datagrams for chat and file catalog/chunk transfer. The project is still a prototype: chunks are currently stored in full on the peer that indexes a file, before distributed placement and replication are added.
+The current `p2p_file.py` uses text messages for membership (`join:`, `join_ack:`, `new_peer:`, `heartbeat:`, and `leave:`), and binary protocol datagrams for chat and file catalog/chunk transfer. File indexing temporarily stores source chunks locally, then asks assigned peers to replicate them; placement, rebalancing, repair, and chunk integrity are implemented but still require live multi-peer verification.
 
 ## 2. Datagram layout
 
@@ -69,8 +69,9 @@ Packet type numbers currently assigned in `protocol_design.py`:
 | 9 | CHUNK_HAVE | 32-byte file ID + `uint32 chunk_index` | Encoder/parser and live ownership update exist. |
 | 10 | REPLICATE_REQ | 32-byte file ID + `uint32 chunk_index` | Encoder/parser exist; receiver asks the sender for its assigned chunk copy. |
 | 11 | NEW_PEER | One 8-byte peer record | Encoder/parser exist; live membership still uses the text message. |
-| 12 | CHUNK_NAK | 32-byte file ID + `uint32 chunk_index` + `uint8 reason` | Live handler sends NOT_STORED when the requested chunk is unavailable and advances to the next owner. |
+| 12 | CHUNK_NAK | 32-byte file ID + `uint32 chunk_index` + `uint8 reason` | Live handler sends NOT_STORED or HASH_MISMATCH; requester advances to another owner. |
 | 13 | CHUNK_ACK | 32-byte file ID + `uint32 chunk_index` + `uint32 cumulative_offset` + `uint32 bitmap` | Live handler acknowledges received fragments and supports selective retransmission in 32-fragment windows. |
+| 14 | CHUNK_HASH | 32-byte file ID + `uint32 chunk_index` + 32-byte SHA-256 digest | Live catalog exchange distributes each chunk's expected digest; receivers verify before storing. |
 
 The registry is not complete until every type has a precise purpose, payload layout, and message flow, or is explicitly marked reserved for a later version.
 
@@ -161,7 +162,19 @@ uint32 chunk_index
 uint8 reason
 ```
 
-Reason codes are `1 = NOT_STORED`, `2 = BUSY`, and `3 = HASH_MISMATCH`. Header `seq_no` and `ack_no` are zero. It tells the requester that the selected owner cannot provide this chunk, so the requester proceeds to another known owner. CHUNK_NAK is not retransmitted. The live handler currently sends NOT_STORED; BUSY and HASH_MISMATCH are reserved for later handling.
+Reason codes are `1 = NOT_STORED`, `2 = BUSY`, and `3 = HASH_MISMATCH`. Header `seq_no` and `ack_no` are zero. It tells the requester that the selected owner cannot provide this chunk or the data failed integrity checking, so the requester proceeds to another known owner. CHUNK_NAK is not retransmitted. The live handler sends NOT_STORED for unavailable chunks and HASH_MISMATCH when a received chunk digest differs from the catalog; BUSY is reserved.
+
+### CHUNK_HASH (type 14) - expected digest for one chunk
+
+Payload:
+
+```text
+32-byte file_id
+uint32 chunk_index
+32-byte chunk_sha256
+```
+
+The payload is exactly 68 bytes; header `seq_no` and `ack_no` are zero. Peers send one CHUNK_HASH for each cataloged chunk after FILE_LIST metadata. A receiver may retain a hash that arrives before FILE_LIST and apply it when file metadata arrives. Downloads and replication wait until the expected hash is known. After reassembly, the receiver compares SHA-256 of the chunk bytes with this digest before storing the chunk and announcing CHUNK_HAVE. On mismatch it sends CHUNK_NAK with reason HASH_MISMATCH and does not store the chunk.
 
 ### NEW_PEER (type 11) - proposed
 
@@ -239,21 +252,21 @@ Current status: binary CHAT and ACK are used by the live P2P program with per-pe
 
 Current basic flow: after at least four peers join, `/index <path>` hashes a file, divides it into 256 KiB chunks, balances two owners per chunk, advertises metadata/ownership, and sends REPLICATE_REQ to remote owners. A destination requests its chunk, reassembles CHUNK_DATA, stores it, and announces CHUNK_HAVE. The source removes its temporary chunk copy after both assigned peers report ownership. A requester uses `/download <file_id_hex> [output_path]`; it fetches chunks in parallel batches of up to four, sends each request up to three times before trying another advertised owner, rebuilds the file, and verifies its SHA-256 against the file ID.
 
-For each requested chunk, the source sends CHUNK_DATA in windows of up to 32 fragments. The receiver sends CHUNK_ACK with cumulative progress and a bitmap of later received fragments. After each 0.75-second wait, the source retransmits only unacknowledged fragments, for at most five send rounds per window; if a window remains incomplete, that source stops sending and the requester can time out and try another owner. If the source does not store the requested chunk, it sends CHUNK_NAK with NOT_STORED and the requester moves to its next advertised owner. These paths are implemented but still need packet-loss and failover testing.
+Peers exchange one CHUNK_HASH digest per cataloged chunk. For each requested chunk, the source sends CHUNK_DATA in windows of up to 32 fragments. The receiver sends CHUNK_ACK with cumulative progress and a bitmap of later received fragments. After each 0.75-second wait, the source retransmits only unacknowledged fragments, for at most five send rounds per window; if a window remains incomplete, that source stops sending and the requester can time out and try another owner. After reassembly, the receiver checks the chunk digest before storing it. A mismatch produces CHUNK_NAK/HASH_MISMATCH; an unavailable chunk produces CHUNK_NAK/NOT_STORED. In either case, the requester tries its next advertised owner. These paths are implemented but still need packet-loss and failover testing.
 
 After a graceful LEAVE or heartbeat timeout, each peer removes the departed owner from its catalog. If a chunk is under-replicated and a surviving owner has the local chunk bytes, the lowest-ID surviving owner sends `REPLICATE_REQ` to an unassigned active peer. It retries the request periodically until a `CHUNK_HAVE` announcement restores the two-owner count. If no surviving peer has the chunk bytes, this mechanism cannot recover it.
 
-When a peer joins, it uses the current peer IDs and balanced placement algorithm to find chunks assigned to it. As existing owners send `FILE_LIST` and `CHUNK_HAVE`, the joining peer requests each missing assigned chunk with `CHUNK_REQUEST`, stores the data, and announces ownership with `CHUNK_HAVE`.
+When a peer joins, it uses the current peer IDs and balanced placement algorithm to find chunks assigned to it. Existing owners send `FILE_LIST`, `CHUNK_HASH`, and `CHUNK_HAVE`; the joining peer waits for each expected digest, requests its missing assigned chunks with `CHUNK_REQUEST`, verifies and stores the data, and announces ownership with `CHUNK_HAVE`.
 
-Limitations: initial placement runs only when `/index` is issued and needs four peers and at least two chunks. Join rebalancing adds the joining peer's assigned copies but does not delete older replicas, so extra copies can remain. Automatic repair and join rebalancing are implemented but still need live multi-peer verification. CHUNK_ACK/CHUNK_NAK handling is connected, but loss recovery and NAK failover still need live verification; BUSY/HASH_MISMATCH reasons and safe removal of surplus replicas are not implemented.
+Limitations: initial placement runs only when `/index` is issued and needs four peers and at least two chunks. Join rebalancing adds the joining peer's assigned copies but does not delete older replicas, so extra copies can remain. Automatic repair and join rebalancing are implemented but still need live multi-peer verification. CHUNK_ACK/CHUNK_NAK and per-chunk CHUNK_HASH handling are connected, but loss recovery, hash mismatch handling, and failover still need live verification; BUSY NAK and safe removal of surplus replicas are not implemented.
 
 ## 7. Current implementation inventory
 
 ### Implemented or prototyped
 
-- 20-byte binary header format and packet type mapping through type 11 in the latest pasted code.
-- Payload encoders for CHAT, CHUNK_REQUEST, ACK, JOIN_ACK, CHUNK_DATA, and CHUNK_HAVE.
-- Partial parsing for CHAT, CHUNK_REQUEST, CHUNK_HAVE, and CHUNK_DATA.
+- 20-byte binary header format and packet type mapping through type 14.
+- Payload encoders/parsers for CHAT, CHUNK_REQUEST, ACK, JOIN_ACK, CHUNK_DATA, FILE_LIST, CHUNK_HAVE, REPLICATE_REQ, CHUNK_ACK, CHUNK_NAK, and CHUNK_HASH.
+- FILE_LIST catalog exchange with per-chunk SHA-256 digest records. CHUNK_HASH datagrams themselves are not retransmitted or acknowledged yet; a missing digest prevents that chunk from being downloaded until catalog information is received.
 - File SHA-256 helper and a local two-fragment CHUNK_DATA reassembly demonstration.
 - In-memory FILE_LIST/CHUNK_HAVE catalog exchange, REPLICATE_REQ placement, and on-disk chunk store.
 - Basic live CHUNK_REQUEST/CHUNK_DATA transfer, parallel batches of four download chunks, request retries, and whole-file SHA-256 verification.

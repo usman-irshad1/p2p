@@ -12,8 +12,9 @@ A student project to build a multi-peer group chat and file-sharing application 
 - [x] Peer IDs, join, peer-list response, and new-peer notifications.
 - [x] Heartbeats, peer timeout removal, and graceful LEAVE handling.
 - [x] A 20-byte application header using network byte order: `!HHBBHIHHHH`.
-- [x] Packet type IDs and payload helpers for JOIN, CHAT, CHUNK_REQUEST, LEAVE, HEARTBEAT, ACK, JOIN_ACK, CHUNK_DATA, FILE_LIST, CHUNK_HAVE, REPLICATE_REQ, and NEW_PEER.
-- [x] CHUNK_ACK selective acknowledgements now drive 32-fragment send windows with bounded retransmission; CHUNK_NAK reports missing chunks and lets downloads try the next owner.
+- [x] Packet type IDs and payload helpers for JOIN, CHAT, CHUNK_REQUEST, LEAVE, HEARTBEAT, ACK, JOIN_ACK, CHUNK_DATA, FILE_LIST, CHUNK_HAVE, REPLICATE_REQ, NEW_PEER, CHUNK_ACK, CHUNK_NAK, and CHUNK_HASH.
+- [x] CHUNK_ACK selective acknowledgements now drive 32-fragment send windows with bounded retransmission; CHUNK_NAK reports missing or corrupt chunks and lets downloads try another owner.
+- [x] Peers exchange a SHA-256 digest for each chunk; incoming chunks are checked before they are stored or advertised.
 - [x] Checksum and packet validation helpers, including CHAT and ACK validation.
 - [x] Local CHUNK_DATA fragmentation and reassembly demonstration: two 500-byte fragments rebuild a 1,000-byte chunk.
 - [x] Reliable ordered chat logic in `p2p_file.py`: per-peer queues, exact ACK matching, retransmission of the same CHAT after one second, duplicate suppression, and in-order acceptance.
@@ -31,6 +32,7 @@ A student project to build a multi-peer group chat and file-sharing application 
 ### Remaining for the full assignment
 
 - [ ] Run a live transfer with packet loss to check selective fragment retry and NOT_STORED failover; save terminal screenshots as evidence.
+- [ ] Corrupt a test chunk or digest and verify the receiver rejects it and tries another owner; save terminal screenshots as evidence.
 - [ ] Run a live four-peer check of catalog exchange, replica placement, download, and the latest Rule 6/7 chat changes; save screenshots as evidence.
 - [ ] Replace the remaining text-based membership messages with the specified binary protocol packets.
 - [ ] Prepare at least two files of 2 MB or larger; split them into fixed-size chunks.
@@ -127,12 +129,13 @@ Rule 6/7 in-memory verification passed. The latest changes still need a live UDP
 
 ```mermaid
 flowchart LR
-    A[Indexer creates chunk placement for four peers] --> B[Send FILE_LIST and local CHUNK_HAVE]
+    A[Indexer creates placement and chunk SHA-256 hashes] --> B[Send FILE_LIST, CHUNK_HASH, and local CHUNK_HAVE]
     B --> C[Send REPLICATE_REQ to assigned remote owners]
     C --> D[Remote owners request their assigned chunks]
     D --> E[Source sends CHUNK_DATA fragments]
-    E --> F[Remote owners reassemble and announce CHUNK_HAVE]
-    F --> G[Requester fetches chunks in parallel batches of four]
+    E --> F[Receiver ACKs fragments and verifies chunk hash]
+    F --> F2[Store valid chunk and announce CHUNK_HAVE]
+    F2 --> G[Requester fetches chunks in parallel batches of four]
     G --> H[Rebuild file and verify SHA-256]
 ```
 
@@ -161,7 +164,7 @@ Measured performance graphs still need real test data. Planned graphs include ch
 
 - Membership control is still text-based; the binary packet helpers are not integrated for every message type.
 - Placement currently runs when `/index` is entered, and needs at least four joined peers and at least two chunks. A file indexed before the group is ready must be indexed again after peers join.
-- CHUNK_ACK/CHUNK_NAK are connected to the live chunk-transfer loop, but packet-loss recovery and NAK failover still need live testing. Only the NOT_STORED NAK reason is currently sent.
+- CHUNK_ACK/CHUNK_NAK and per-chunk hash verification are connected to the live transfer loop, but packet-loss recovery, hash mismatch handling, and failover still need live testing. NOT_STORED and HASH_MISMATCH are the active NAK reasons.
 - The peer list and reliability state exist only in memory.
 - The advertised `127.0.0.1` address supports same-computer testing, not communication between separate computers.
 

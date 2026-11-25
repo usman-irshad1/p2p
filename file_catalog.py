@@ -11,6 +11,7 @@ Catalog shape:
         "chunk_size": int,
         "filename": str,
         "chunk_count": int,
+        "chunk_hashes": {chunk_index: bytes},
         "chunk_owners": {chunk_index: {peer_id, ...}},
     }
 }
@@ -83,12 +84,34 @@ def add_file(catalog, file_id, file_size, chunk_size, filename):
         "chunk_size": chunk_size,
         "filename": filename,
         "chunk_count": chunk_count,
+        "chunk_hashes": {},
         "chunk_owners": {
             chunk_index: set()
             for chunk_index in range(chunk_count)
         },
     }
     return file_id
+
+
+def set_chunk_hash(catalog, file_id, chunk_index, chunk_hash):
+    """Record one expected chunk digest, rejecting conflicting values."""
+    _validate_file_id(file_id)
+    if not isinstance(chunk_index, int) or isinstance(chunk_index, bool):
+        raise ValueError("chunk_index must be an integer")
+    if not isinstance(chunk_hash, bytes) or len(chunk_hash) != 32:
+        raise ValueError("chunk_hash must be a 32-byte SHA-256 digest")
+    metadata = catalog.get(file_id)
+    if metadata is None:
+        raise KeyError("file metadata must be added before its chunk hash")
+    if chunk_index not in metadata["chunk_owners"]:
+        raise ValueError("chunk_index is outside this file's chunk range")
+
+    hashes = metadata["chunk_hashes"]
+    existing_hash = hashes.get(chunk_index)
+    if existing_hash is not None and existing_hash != chunk_hash:
+        raise ValueError("Conflicting hash for this file chunk")
+    hashes[chunk_index] = chunk_hash
+    return existing_hash is None
 
 
 def register_file(catalog, file_path, chunk_size):

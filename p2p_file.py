@@ -6,6 +6,7 @@ import sys
 import time
 import struct
 import os
+import hashlib
 from collections import deque
 import protocol_design
 import file_catalog as file_catalog_helpers
@@ -26,6 +27,7 @@ outgoing_chat_queues = {}
 pending_chats = {}
 file_catalog_state = file_catalog_helpers.create_catalog()
 pending_chunk_have = set()
+pending_chunk_hashes = {}
 pending_chunk_downloads = {}
 pending_chunk_sends = {}
 pending_replication_requests = set()
@@ -218,6 +220,11 @@ def send_file_catalog_to_peer(destination_id, destination_addr):
     """Send known file metadata and this peer's chunk claims to one peer."""
     with file_catalog_lock:
         records = file_catalog_helpers.file_list_records(file_catalog_state)
+        chunk_hashes = [
+            (file_id, chunk_index, chunk_hash)
+            for file_id, metadata in file_catalog_state.items()
+            for chunk_index, chunk_hash in metadata["chunk_hashes"].items()
+        ]
         local_chunks = [
             (file_id, chunk_index)
             for file_id, metadata in file_catalog_state.items()
@@ -245,6 +252,19 @@ def send_file_catalog_to_peer(destination_id, destination_addr):
         )
         if len(datagram) > protocol_design.MAX_DATAGRAM_SIZE:
             raise ValueError("A FILE_LIST record exceeds the 1,024-byte limit")
+        server.sendto(datagram, destination_addr)
+
+    for file_id, chunk_index, chunk_hash in chunk_hashes:
+        datagram = protocol_design.make_datagram(
+            packet_name="CHUNK_HASH",
+            peer_id=peer_id,
+            destination_p_id=destination_id,
+            protocol_version=protocol_design.PROTOCOL_VERSION,
+            flags=0,
+            group_id=0,
+            seq_no=0,
+            payload=(file_id, chunk_index, chunk_hash),
+        )
         server.sendto(datagram, destination_addr)
 
     for file_id, chunk_index in local_chunks:
@@ -471,6 +491,7 @@ def rebalance_chunks_for_local_peer():
             (
                 file_id,
                 metadata["chunk_count"],
+                set(metadata["chunk_hashes"]),
                 {
                     chunk_index: set(owners)
                     for chunk_index, owners in metadata["chunk_owners"].items()
@@ -480,10 +501,12 @@ def rebalance_chunks_for_local_peer():
         )
 
     tasks_started = 0
-    for file_id, chunk_count, chunk_owners in file_entries:
+    for file_id, chunk_count, known_hash_indices, chunk_owners in file_entries:
         placement = plan_chunk_owners(chunk_count, participants)
         for chunk_index, designated_owners in placement.items():
             if peer_id not in designated_owners:
+                continue
+            if chunk_index not in known_hash_indices:
                 continue
             if peer_id in chunk_owners[chunk_index]:
                 continue
@@ -532,6 +555,19 @@ def register_file_metadata(file_path):
         file_id,
         metadata["chunk_size"],
     )
+    with file_catalog_lock:
+        for chunk_index in chunk_indices:
+            chunk_data = chunk_store.load_chunk(
+                CHUNK_STORE_DIR,
+                file_id,
+                chunk_index,
+            )
+            file_catalog_helpers.set_chunk_hash(
+                file_catalog_state,
+                file_id,
+                chunk_index,
+                hashlib.sha256(chunk_data).digest(),
+            )
     requests_sent = distribute_file_chunks(file_id)
     return file_id, metadata, len(chunk_indices), requests_sent
 
@@ -611,6 +647,7 @@ def send_chunk_data(destination_id, destination_addr, file_id, chunk_index):
         "total_size": total_chunk_size,
         "fragments": fragments,
         "acked": set(),
+        "error": None,
         "event": threading.Event(),
     }
     with chunk_send_lock:
@@ -628,6 +665,8 @@ def send_chunk_data(destination_id, destination_addr, file_id, chunk_index):
 
             for _ in range(CHUNK_FRAGMENT_RETRIES):
                 with chunk_send_lock:
+                    if send_state["error"] is not None:
+                        return
                     missing_offsets = window_offsets - send_state["acked"]
                     send_state["event"].clear()
                 if not missing_offsets:
@@ -638,6 +677,9 @@ def send_chunk_data(destination_id, destination_addr, file_id, chunk_index):
                         server.sendto(datagram, destination_addr)
 
                 send_state["event"].wait(CHUNK_ACK_TIMEOUT)
+                with chunk_send_lock:
+                    if send_state["error"] is not None:
+                        return
 
             with chunk_send_lock:
                 window_complete = window_offsets.issubset(send_state["acked"])
@@ -662,6 +704,10 @@ def request_chunk(file_id, chunk_index, preferred_owner_id=None, preferred_addr=
         owners = tuple(sorted(metadata["chunk_owners"][chunk_index]))
         file_size = metadata["file_size"]
         chunk_size = metadata["chunk_size"]
+        expected_chunk_hash = metadata["chunk_hashes"].get(chunk_index)
+
+    if expected_chunk_hash is None:
+        raise ValueError("Expected chunk hash has not arrived from the catalog")
 
     if chunk_store.has_chunk(CHUNK_STORE_DIR, file_id, chunk_index):
         if preferred_owner_id is not None:
@@ -694,6 +740,7 @@ def request_chunk(file_id, chunk_index, preferred_owner_id=None, preferred_addr=
             "owner_id": owner_id,
             "owner_addr": owner_addr,
             "expected_size": expected_size,
+            "expected_hash": expected_chunk_hash,
             "total_size": None,
             "fragments": {},
             "event": event,
@@ -747,7 +794,8 @@ def replicate_chunk_from_peer(file_id, chunk_index, owner_id, owner_addr):
 def start_replication_request(file_id, chunk_index, owner_id, owner_addr):
     """Start a requested replica transfer once file metadata is available."""
     with file_catalog_lock:
-        if file_id not in file_catalog_state:
+        metadata = file_catalog_state.get(file_id)
+        if metadata is None or chunk_index not in metadata["chunk_hashes"]:
             pending_replication_requests.add(
                 (file_id, chunk_index, owner_id, owner_addr)
             )
@@ -1178,14 +1226,15 @@ def handle_protocol_chat_or_ack(message, addr):
 
 
 def handle_protocol_catalog(message, addr):
-    """Process FILE_LIST metadata and CHUNK_HAVE ownership announcements."""
+    """Process FILE_LIST, CHUNK_HASH, and CHUNK_HAVE catalog messages."""
     if len(message) < protocol_design.header_size:
         return False
 
     packet_type = message[4]
     file_list_type = protocol_design.get_packet_type("FILE_LIST")
     chunk_have_type = protocol_design.get_packet_type("CHUNK_HAVE")
-    if packet_type not in (file_list_type, chunk_have_type):
+    chunk_hash_type = protocol_design.get_packet_type("CHUNK_HASH")
+    if packet_type not in (file_list_type, chunk_have_type, chunk_hash_type):
         return False
 
     try:
@@ -1197,9 +1246,14 @@ def handle_protocol_catalog(message, addr):
 
         if packet_type == file_list_type:
             file_records = protocol_design.check_datagram(message, show_output=False)
-        else:
+        elif packet_type == chunk_have_type:
             file_id, chunk_index = protocol_design.check_datagram(
                 message, show_output=False
+            )
+        else:
+            file_id, chunk_index, chunk_hash = protocol_design.check_datagram(
+                message,
+                show_output=False,
             )
 
         if destination_id != peer_id:
@@ -1221,6 +1275,19 @@ def handle_protocol_catalog(message, addr):
             ready_replications = []
             with file_catalog_lock:
                 file_catalog_helpers.merge_file_list(file_catalog_state, file_records)
+                for pending_key, pending_hash in tuple(pending_chunk_hashes.items()):
+                    pending_file_id, pending_index = pending_key
+                    if pending_file_id in file_catalog_state:
+                        try:
+                            file_catalog_helpers.set_chunk_hash(
+                                file_catalog_state,
+                                pending_file_id,
+                                pending_index,
+                                pending_hash,
+                            )
+                        except ValueError:
+                            pass
+                        pending_chunk_hashes.pop(pending_key, None)
                 for pending_item in tuple(pending_chunk_have):
                     pending_file_id, pending_index, owner_id = pending_item
                     if pending_file_id in file_catalog_state:
@@ -1239,7 +1306,11 @@ def handle_protocol_catalog(message, addr):
 
                 for pending_request in tuple(pending_replication_requests):
                     pending_file_id, pending_index, owner_id, owner_addr = pending_request
-                    if pending_file_id in file_catalog_state:
+                    pending_metadata = file_catalog_state.get(pending_file_id)
+                    if (
+                        pending_metadata is not None
+                        and pending_index in pending_metadata["chunk_hashes"]
+                    ):
                         ready_replications.append(pending_request)
                         pending_replication_requests.discard(pending_request)
 
@@ -1260,7 +1331,7 @@ def handle_protocol_catalog(message, addr):
                     owner_addr,
                 )
             rebalance_chunks_for_local_peer()
-        else:
+        elif packet_type == chunk_have_type:
             with file_catalog_lock:
                 if file_id in file_catalog_state:
                     is_new = file_catalog_helpers.add_chunk_owner(
@@ -1279,6 +1350,35 @@ def handle_protocol_catalog(message, addr):
                     f"from peer {sender_id}"
                 )
                 maybe_release_staged_chunk(file_id, chunk_index)
+            rebalance_chunks_for_local_peer()
+        else:
+            ready_replications = []
+            with file_catalog_lock:
+                if file_id in file_catalog_state:
+                    file_catalog_helpers.set_chunk_hash(
+                        file_catalog_state,
+                        file_id,
+                        chunk_index,
+                        chunk_hash,
+                    )
+                else:
+                    pending_chunk_hashes[(file_id, chunk_index)] = chunk_hash
+
+                metadata = file_catalog_state.get(file_id)
+                if metadata is not None and chunk_index in metadata["chunk_hashes"]:
+                    for pending_request in tuple(pending_replication_requests):
+                        request_file_id, request_index, _, _ = pending_request
+                        if request_file_id == file_id and request_index == chunk_index:
+                            ready_replications.append(pending_request)
+                            pending_replication_requests.discard(pending_request)
+
+            for pending_file_id, pending_index, owner_id, owner_addr in ready_replications:
+                start_replication_request(
+                    pending_file_id,
+                    pending_index,
+                    owner_id,
+                    owner_addr,
+                )
             rebalance_chunks_for_local_peer()
 
     except (ValueError, UnicodeDecodeError, KeyError) as error:
@@ -1390,6 +1490,13 @@ def handle_chunk_transfer(message, addr):
                         f"Peer rejected chunk request (reason {reason})"
                     )
                     state["event"].set()
+            if reason == protocol_design.CHUNK_NAK_REASONS["HASH_MISMATCH"]:
+                transfer_key = (sender_id, file_id, chunk_index)
+                with chunk_send_lock:
+                    send_state = pending_chunk_sends.get(transfer_key)
+                    if send_state is not None and send_state["addr"] == addr:
+                        send_state["error"] = "Receiver reported a chunk hash mismatch"
+                        send_state["event"].set()
             return True
 
         if packet_type == request_type:
@@ -1455,18 +1562,17 @@ def handle_chunk_transfer(message, addr):
                 return True
             state["fragments"][fragment_offset] = fragment_data
 
-            send_chunk_ack(
-                sender_id,
-                addr,
-                file_id,
-                chunk_index,
-                state["fragments"],
-            )
-
             expected_offset = 0
             ordered_fragments = []
             for offset, data in sorted(state["fragments"].items()):
                 if offset != expected_offset:
+                    send_chunk_ack(
+                        sender_id,
+                        addr,
+                        file_id,
+                        chunk_index,
+                        state["fragments"],
+                    )
                     return True
                 ordered_fragments.append(
                     (file_id, chunk_index, offset, total_chunk_size, data)
@@ -1475,13 +1581,40 @@ def handle_chunk_transfer(message, addr):
 
             if expected_offset == total_chunk_size:
                 rebuilt_chunk = protocol_design.reassemble_chunk(ordered_fragments)
+                if hashlib.sha256(rebuilt_chunk).digest() != state["expected_hash"]:
+                    state["error"] = "Received chunk SHA-256 did not match catalog"
+                    send_chunk_nak(
+                        sender_id,
+                        addr,
+                        file_id,
+                        chunk_index,
+                        protocol_design.CHUNK_NAK_REASONS["HASH_MISMATCH"],
+                    )
+                    state["event"].set()
+                    return True
+
                 chunk_store.store_chunk(
                     CHUNK_STORE_DIR,
                     file_id,
                     chunk_index,
                     rebuilt_chunk,
                 )
+                send_chunk_ack(
+                    sender_id,
+                    addr,
+                    file_id,
+                    chunk_index,
+                    state["fragments"],
+                )
                 state["event"].set()
+            else:
+                send_chunk_ack(
+                    sender_id,
+                    addr,
+                    file_id,
+                    chunk_index,
+                    state["fragments"],
+                )
 
     except (OSError, ValueError, UnicodeDecodeError) as error:
         print(f"Ignoring invalid chunk packet from {addr}: {error}")
