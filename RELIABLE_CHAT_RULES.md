@@ -18,13 +18,13 @@ The `CHAT` payload is:
 uint32 chat_sequence | UTF-8 text bytes
 ```
 
-`chat_sequence` is a per-sender, per-recipient counter that begins at 1. The same group chat text may carry different `chat_sequence` values for different recipients.
+`chat_sequence` is a per-sender, per-recipient counter that begins at 1. The same group chat text may carry different `chat_sequence` values for different recipients. It orders that recipient's messages from this sender.
 
 The current receiver uses `recvfrom(1024)`. Version 1 therefore limits the complete application datagram to 1,024 bytes. With a 20-byte header and 4-byte chat sequence, UTF-8 text is limited to 1,000 bytes. The limit counts encoded bytes, not characters.
 
 ## 3. Sequence numbers
 
-The header `seq_no` is a 16-bit counter for reliable datagrams sent in one direction between two peers. It is separate from the 32-bit `chat_sequence` in the payload. Each counter starts at 1 for a newly established peer-to-peer session.
+The header `seq_no` is a 16-bit counter for CHAT datagrams sent in one direction between two peers. It is separate from the 32-bit `chat_sequence` in the payload. Each counter starts at 1 for a newly established peer-to-peer session. Both counters are per recipient and do not wrap; peer removal clears their state. Other version 1 packet types use zero for both header sequence fields.
 
 Version 1 does not wrap either counter. Before either counter would exceed its field's maximum, the sender must leave and establish a new peer session using a new peer ID. The new session starts its counters at 1. Receivers discard the old session's pending chat, expected-sequence, and duplicate-tracking state when that peer is removed.
 
@@ -36,9 +36,11 @@ A receiver sends an ACK only after validating the datagram's version, checksum, 
 
 ## 5. Sending, retransmission, and delivery
 
-For each recipient, the sender allows at most one unacknowledged CHAT datagram at a time. Later chat messages for that recipient wait in order until the outstanding message is acknowledged. The sender can send to other recipients independently.
+For each recipient, the sender may have up to eight unacknowledged CHAT datagrams in flight. The sender fills the available per-recipient window in sequence order. Each recipient stream is independent, so a slow peer does not block chat delivery to the other peers.
 
-If the sender has not received a matching ACK after 1 second, it retransmits the exact same datagram with the same `seq_no` and `chat_sequence`. It continues retrying while the recipient remains active. If the existing 15-second heartbeat timeout removes the recipient, the sender stops retrying and marks delivery to that peer as failed. Delivery to other active peers continues.
+The initial retransmission timeout (RTO) is 1 second. The peer estimates round-trip time from ACKs for datagrams that were not retransmitted, updates SRTT and RTTVAR, and sets `RTO = SRTT + 4 * RTTVAR`, clamped to 0.2–3 seconds. After a timeout, that datagram's timeout doubles up to 3 seconds. The sender retransmits the exact same datagram with unchanged `seq_no` and `chat_sequence` until it receives the matching ACK or the recipient is removed. Other datagrams in the window may still be acknowledged and delivered independently.
+
+Heartbeats are sent every 2 seconds. A peer with no heartbeat for 6 seconds is removed; its queued and pending chat is cleared and retries stop. Delivery to other active peers continues.
 
 ## 6. Duplicate handling and order
 
@@ -49,7 +51,7 @@ The receiver tracks the expected `seq_no` and `chat_sequence` for each sender-re
 - A CHAT with a later-than-expected sequence is not delivered or ACKed. The sender's retransmission of the missing datagram allows the stream to recover.
 - A CHAT with an earlier sequence that is not a recognized duplicate is discarded without delivery.
 
-Because the sender waits for each recipient's ACK before sending that recipient's next CHAT, later messages cannot overtake an earlier unacknowledged message in that stream.
+The receiver advances its expected packet and chat counters only when it accepts the next expected CHAT. Later messages arriving early are discarded without ACK; their sender retries them after the missing earlier message has been acknowledged and delivered. This preserves the accepted chat order despite the eight-packet window.
 
 ## 7. Peer failures and guarantee boundary
 
@@ -67,8 +69,8 @@ Sender                                 Receiver
   |                                       | if expected: display once
   |<-- ACK(ack_no = CHAT.seq_no) ----------|
   |                                       |
-  |     on 1-second timeout: resend same  |
-  |     CHAT with unchanged sequence IDs  |
+  |     on per-peer RTO: resend same CHAT |
+  |     with unchanged sequence IDs       |
 ```
 
-The flow repeats per recipient. ACKs are not ACKed. If the receiver sees a valid duplicate CHAT, it sends the matching ACK again and suppresses duplicate display.
+The sender can keep at most eight CHAT datagrams pending per recipient. The initial RTO is 1 second; subsequent RTOs adapt to ACK timing and are bounded to 0.2–3 seconds with exponential backoff. The flow repeats independently per recipient. ACKs are not ACKed. If the receiver sees a valid duplicate CHAT, it sends the matching ACK again and suppresses duplicate display. Heartbeat interval is 2 seconds and peer timeout is 6 seconds.

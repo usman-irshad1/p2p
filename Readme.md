@@ -4,7 +4,7 @@ A student project to build a multi-peer group chat and file-sharing application 
 
 ## Project status
 
-**Approximate implementation coverage: 90%.** A joining peer now fetches the chunks assigned to it by the balanced placement plan. File placement, transfer, and repair still need live multi-peer checks; treat this percentage as a planning estimate until the four-peer demo succeeds.
+**Status:** The PDF's small-group protocol improvements are implemented in code and documented; live multi-peer verification is still pending. Placement uses bounded HRW hashing, downloads use ranged requests with resume/failover and a sliding worker pool, and peers compare membership-view hashes.
 
 ### Implemented or prototyped
 
@@ -12,30 +12,36 @@ A student project to build a multi-peer group chat and file-sharing application 
 - [x] Peer IDs, join, peer-list response, and new-peer notifications.
 - [x] Heartbeats, peer timeout removal, and graceful LEAVE handling.
 - [x] A 20-byte application header using network byte order: `!HHBBHIHHHH`.
-- [x] Packet type IDs and payload helpers for JOIN, CHAT, CHUNK_REQUEST, LEAVE, HEARTBEAT, ACK, JOIN_ACK, CHUNK_DATA, FILE_LIST, CHUNK_HAVE, REPLICATE_REQ, NEW_PEER, CHUNK_ACK, CHUNK_NAK, CHUNK_HASH, and CHUNK_HASH_ACK.
+- [x] Packet type IDs and payload helpers for JOIN, CHAT, ranged CHUNK_REQUEST, LEAVE, HEARTBEAT, ACK, JOIN_ACK, CHUNK_DATA, FILE_LIST, FILE_LIST_ACK, CHUNK_HAVE, CHUNK_HAVE_ACK, REPLICATE_REQ, NEW_PEER, CHUNK_ACK, CHUNK_NAK, CHUNK_HASH, CHUNK_HASH_ACK, and PEER_LIST_REQ.
 - [x] CHUNK_ACK selective acknowledgements now drive 32-fragment send windows with bounded retransmission; CHUNK_NAK reports missing or corrupt chunks and lets downloads try another owner.
 - [x] Peers exchange a SHA-256 digest for each chunk; incoming chunks are checked before they are stored or advertised.
 - [x] CHUNK_HASH delivery retries the same digest packet after one second, up to five times, until the matching CHUNK_HASH_ACK arrives.
+- [x] FILE_LIST records are acknowledged per file and retried after one second, up to five times, if the FILE_LIST_ACK is lost.
+- [x] CHUNK_HAVE ownership announcements are acknowledged and retried after one second, up to five times, if the matching CHUNK_HAVE_ACK is lost.
 - [x] Checksum and packet validation helpers, including CHAT and ACK validation.
 - [x] Local CHUNK_DATA fragmentation and reassembly demonstration: two 500-byte fragments rebuild a 1,000-byte chunk.
-- [x] Reliable ordered chat logic in `p2p_file.py`: per-peer queues, exact ACK matching, retransmission of the same CHAT after one second, duplicate suppression, and in-order acceptance.
+- [x] Reliable ordered chat logic in `p2p_file.py`: per-peer queues, exact ACK matching, an eight-packet window, adaptive retransmission timing, duplicate suppression, and in-order acceptance.
 - [x] In-memory checks passed for Rules 6 and 7: duplicates are ACKed but not displayed twice, out-of-order messages are rejected, and peer removal clears chat and sequence state.
 - [x] Live FILE_LIST and CHUNK_HAVE catalog exchange on peer join, plus `/files` to inspect known metadata and chunk owners.
 - [x] `chunk_store.py` writes individual chunks to disk and rebuilds a file in order with a full-file SHA-256 check.
-- [x] `/index <path>` splits a file into 256 KiB chunks; with at least four peers, it assigns two distinct peers per chunk and asks remote owners to copy their assigned chunks.
-- [x] `/download <file_id_hex> [output_path]` requests chunks in parallel batches of four and verifies the rebuilt file's SHA-256.
-- [x] CHUNK_REQUEST and fragmented CHUNK_DATA transfer are connected to the live UDP message loop; each request is sent up to three times, and temporary source copies are removed after both assigned peers announce ownership.
+- [x] `/index <path>` splits a file into 256 KiB chunks; bounded HRW placement selects two distinct owners per chunk from at least three known peers and avoids assigning every chunk to one peer.
+- [x] `/download <file_id_hex> [output_path]` uses a sliding pool of up to four chunk workers, prefers rare chunks, caps planned concurrent downloads at two per source, and verifies the rebuilt file's SHA-256.
+- [x] CHUNK_REQUEST carries a start offset and length so a download can resume at the first missing byte; a source change is attempted after three adaptive RTOs without progress.
+- [x] CHUNK_DATA transmission pauses briefly after each eight-fragment burst; the UDP socket requests a 4 MiB receive buffer (the operating system may clamp this value).
 - [x] Live CHUNK_ACK/CHUNK_NAK handling: receivers report cumulative progress and selective fragment receipt; each 32-fragment window gets up to five send rounds, and a missing chunk triggers NOT_STORED.
 - [x] On LEAVE or heartbeat timeout, the lowest-ID surviving owner asks an unassigned peer to copy an under-replicated chunk; repair requests retry until a replacement owner is announced.
 - [x] When a peer joins, it computes its assigned share and fetches missing chunks from known owners; old replicas are retained, so this is additive rebalancing.
+- [x] Heartbeats include a CRC-32 membership-view hash; two consecutive mismatches trigger a binary PEER_LIST_REQ and JOIN_ACK snapshot exchange.
+- [x] Bootstrap peers assign joining peer IDs from their currently known active IDs.
+- [x] Membership uses binary JOIN, JOIN_ACK, NEW_PEER, HEARTBEAT, LEAVE, and PEER_LIST_REQ datagrams; JOIN is retried and deduplicated by UDP source address.
 - [x] Local screenshots show peers joining and receiving sequential chat messages. Evidence is collected in [the debugging PDF](evidence/p2p_debug_outputs.pdf).
 
 ### Remaining for the full assignment
 
-- [ ] Run a live transfer with packet loss to check CHUNK_HASH retry, selective fragment retry, and NOT_STORED failover; save terminal screenshots as evidence.
+- [ ] Run a live transfer with packet loss to check FILE_LIST, CHUNK_HASH, and CHUNK_HAVE retries, selective fragment retry, and NOT_STORED failover; save terminal screenshots as evidence.
 - [ ] Corrupt a test chunk or digest and verify the receiver rejects it and tries another owner; save terminal screenshots as evidence.
 - [ ] Run a live four-peer check of catalog exchange, replica placement, download, and the latest Rule 6/7 chat changes; save screenshots as evidence.
-- [ ] Replace the remaining text-based membership messages with the specified binary protocol packets.
+- [x] Replace text membership messages with binary protocol packets; live multi-peer and packet-loss verification remains pending.
 - [ ] Prepare at least two files of 2 MB or larger; split them into fixed-size chunks.
 - [ ] Verify live that each chunk has two owners and no peer's chunk store holds the complete file.
 - [x] Implement automatic re-replication after an owner leaves or times out; live verification remains pending.
@@ -78,34 +84,38 @@ Copy the 64-character file ID printed by `/index` or `/files`, then download it 
 /download FILE_ID_HEX
 ```
 
-Index a file after all four peers have joined so it can assign replicas. By default, the reconstructed file is saved under `downloads/` using its catalog filename. The source keeps temporary chunks until both assigned peers announce their copies; interrupted replication can leave temporary source chunks behind.
+For the assignment demo, start at least four peers before indexing files. The code can place chunks with three known peers, but four peers remain the project target. By default, the reconstructed file is saved under `downloads/` using its catalog filename. The source keeps temporary chunks until both assigned peers announce their copies; interrupted replication can leave temporary source chunks behind.
 
 ## Workflows
 
 ### Peer discovery and membership
 
-Membership control messages are currently text-based. A newcomer contacts a bootstrap peer, receives its peer list, and is announced to the other peers.
+Membership control uses binary protocol packets. A newcomer retries JOIN to its configured bootstrap until JOIN_ACK assigns an ID and returns the known peer list. The bootstrap announces it to existing peers with NEW_PEER; heartbeats can also introduce a peer if that announcement was lost. Repeated membership-view mismatches trigger a peer-list request.
 
 ```mermaid
 flowchart TD
     A[Start peer and bind UDP port] --> B{Bootstrap address provided?}
     B -- No --> C[Start as first peer]
     B -- Yes --> D[Send JOIN to bootstrap]
+    D -. No JOIN_ACK after 1 second: resend, at most 5 retries .-> D
     D --> E[Bootstrap records newcomer]
-    E --> F[Send peer list to newcomer]
-    E --> G[Notify existing peers]
-    F --> H[Newcomer updates peer list]
+    E --> F[Binary JOIN_ACK carries ID and peer list]
+    E --> G[Binary NEW_PEER to existing peers]
+    F --> H[Newcomer updates peer list and catalog]
     G --> I[Existing peers add newcomer]
     H --> J[Peers exchange heartbeats]
     I --> J
-    J --> K{LEAVE received or heartbeat timeout?}
-    K -- LEAVE --> L[Remove leaving peer]
-    K -- Timeout --> M[Remove silent peer]
+    J --> K{Membership views match?}
+    K -- No, twice --> R[PEER_LIST_REQ and JOIN_ACK repair]
+    K -- Yes --> S[Continue membership]
+    J --> T{LEAVE received or heartbeat timeout?}
+    T -- LEAVE --> L[Remove leaving peer]
+    T -- Timeout --> M[Remove silent peer]
 ```
 
 ### Reliable chat
 
-The sender maintains an independent stop-and-wait chat stream for each recipient. Each receiver validates CHAT packets, accepts only the expected sequence, ACKs recognized duplicates without displaying them again, and rejects out-of-order packets without an ACK.
+The sender maintains an independent ordered chat stream for each recipient, with up to eight CHAT packets outstanding. Each receiver validates CHAT packets, accepts only the next expected message, ACKs recognized duplicates without displaying them again, and rejects out-of-order packets without an ACK. Per-peer RTO adapts from unambiguous ACK timings.
 
 ```mermaid
 sequenceDiagram
@@ -137,7 +147,8 @@ flowchart LR
     E --> F[Receiver ACKs fragments and verifies chunk hash]
     F --> F2[Store valid chunk and announce CHUNK_HAVE]
     F2 --> G[Requester fetches chunks in parallel batches of four]
-    G --> H[Rebuild file and verify SHA-256]
+    G --> H[Resume or fail over after three RTOs]
+    H --> I[Rebuild file and verify SHA-256]
 ```
 
 ## Current measurements and graphs
@@ -147,8 +158,8 @@ The current values below are configuration and local demonstrations, not perform
 Heartbeat settings (each `#` represents one second):
 
 ```text
-Heartbeat interval  #####               5 seconds
-Peer timeout        ###############    15 seconds
+Heartbeat interval  ##                  2 seconds
+Peer timeout        ######              6 seconds
 ```
 
 Local CHUNK_DATA reassembly demonstration:
@@ -163,9 +174,10 @@ Measured performance graphs still need real test data. Planned graphs include ch
 
 ## Current limitations
 
-- Membership control is still text-based; the binary packet helpers are not integrated for every message type.
-- Placement currently runs when `/index` is entered, and needs at least four joined peers and at least two chunks. A file indexed before the group is ready must be indexed again after peers join.
-- CHUNK_ACK/CHUNK_NAK and CHUNK_HASH/CHUNK_HASH_ACK are connected to the live transfer loop, but packet-loss recovery, hash mismatch handling, and failover still need live testing. NOT_STORED and HASH_MISMATCH are the active NAK reasons.
+- Membership uses binary packets. Multi-peer, packet-loss, simultaneous-join, and oversized peer-list behavior still need live verification. JOIN_ACK peer lists currently fit in a single datagram only.
+- Placement currently runs when `/index` is entered and needs at least three known peers and two chunks. A file indexed before the group is ready must be indexed again after peers join.
+- CHUNK_ACK/CHUNK_NAK, CHUNK_HASH/CHUNK_HASH_ACK, FILE_LIST/FILE_LIST_ACK, and CHUNK_HAVE/CHUNK_HAVE_ACK are connected to the live transfer loop, but packet-loss recovery, hash mismatch handling, and adaptive failover still need live testing. NOT_STORED and HASH_MISMATCH are the active NAK reasons.
+- Join-time rebalancing retains old replicas. Safe surplus-copy deletion is not implemented because membership views and replacement ownership still need live verification.
 - The peer list and reliability state exist only in memory.
 - The advertised `127.0.0.1` address supports same-computer testing, not communication between separate computers.
 
