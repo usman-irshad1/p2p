@@ -113,6 +113,8 @@ FILE_LIST_ACK_TIMEOUT = 1
 FILE_LIST_RETRIES = 5
 CHUNK_HAVE_ACK_TIMEOUT = 1
 CHUNK_HAVE_RETRIES = 5
+REBALANCE_MAX_ATTEMPTS = 3
+REBALANCE_RETRY_DELAY = 1
 CHUNK_REPAIR_RETRY_INTERVAL = CHUNK_REQUEST_TIMEOUT * 2
 MIN_DISTRIBUTION_PEERS = 3
 MAX_JOIN_ACK_PEERS = (
@@ -729,7 +731,22 @@ def rebalance_chunk_from_peers(file_id, chunk_index):
     """Fetch one chunk assigned to this peer by the current placement plan."""
     task_key = (file_id, chunk_index, peer_id)
     try:
-        request_chunk(file_id, chunk_index)
+        last_error = None
+        for attempt in range(REBALANCE_MAX_ATTEMPTS):
+            try:
+                # Refresh the catalog owner list on each attempt. A newly
+                # joined peer can receive FILE_LIST, hashes, and CHUNK_HAVE
+                # in separate datagrams, so the first snapshot may be partial.
+                request_chunk(file_id, chunk_index)
+                last_error = None
+                break
+            except (OSError, ValueError, TimeoutError) as error:
+                last_error = error
+                if attempt + 1 < REBALANCE_MAX_ATTEMPTS and joined_network:
+                    time.sleep(REBALANCE_RETRY_DELAY)
+
+        if last_error is not None:
+            raise last_error
         print(
             f"Rebalanced chunk {chunk_index} of {file_id.hex()[:8]} "
             f"onto peer {peer_id}"
