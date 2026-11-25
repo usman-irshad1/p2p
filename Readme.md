@@ -4,11 +4,11 @@ A student project to build a multi-peer group chat and file-sharing application 
 
 ## Project status
 
-**Status:** Code is in place for all five numbered prototype changes in the PDF's “Changes from the current prototype” section. Live multi-peer verification is still pending.
+**Status:** The fixed code in `p2p_fixed.zip` is applied. The supplied unit and four-peer localhost integration checks passed on 25 Nov 2026; LAN interoperability and packet-loss simulation remain unverified.
 
 ### Progress against `protocol_improvements.pdf`
 
-**Implementation: 5/5 numbered prototype changes present in code. Live verification: pending.** This count covers the PDF's five-item change list, not every general option or future improvement discussed elsewhere in the study.
+**Implementation: 5/5 numbered prototype changes present in code.** This count covers the PDF's five-item change list, not every general option or future improvement discussed elsewhere in the study. The supplied integration run verified replica placement, multi-source download, and crash recovery on localhost. It did not simulate random packet loss.
 
 1. [x] Selective `CHUNK_ACK`: 32-fragment windows; retransmit fragments that remain unacknowledged.
 2. [x] Pace `CHUNK_DATA` bursts and request a 4 MiB UDP receive buffer.
@@ -16,7 +16,7 @@ A student project to build a multi-peer group chat and file-sharing application 
 4. [x] Ranged `CHUNK_REQUEST` with resume offsets, `CHUNK_NAK` failover, and per-chunk SHA-256 metadata/checking (`CHUNK_HASH`).
 5. [x] Bootstrap ID assignment, heartbeat membership-view hashes and repair, and bounded HRW placement across at least three peers.
 
-These items are implemented in the current code. They still need the live four-peer, loss, source-failure, replica-count, and integrity checks listed below before being called demonstrated or verified.
+These items are implemented in the current code. See the checklist below for what the integration run demonstrated and what still needs assignment-specific evidence.
 
 ### Implemented or prototyped
 
@@ -33,11 +33,14 @@ These items are implemented in the current code. They still need the live four-p
 - [x] Checksum and packet validation helpers, including CHAT and ACK validation.
 - [x] Local CHUNK_DATA fragmentation and reassembly demonstration: two 500-byte fragments rebuild a 1,000-byte chunk.
 - [x] Reliable ordered chat logic in `p2p_file.py`: per-peer queues, exact ACK matching, an eight-packet window, adaptive retransmission timing, duplicate suppression, and in-order acceptance.
+- [x] Version 2 chat session IDs let a sender restart its per-peer counters after membership removal without being mistaken for an old duplicate.
 - [x] In-memory checks passed for Rules 6 and 7: duplicates are ACKed but not displayed twice, out-of-order messages are rejected, and peer removal clears chat and sequence state.
 - [x] Live FILE_LIST and CHUNK_HAVE catalog exchange on peer join, plus `/files` to inspect known metadata and chunk owners.
 - [x] `chunk_store.py` writes individual chunks to disk and rebuilds a file in order with a full-file SHA-256 check.
 - [x] `/index <path>` splits a file into 256 KiB chunks; bounded HRW placement selects two distinct owners per chunk from at least three known peers and avoids assigning every chunk to one peer.
 - [x] `/download <file_id_hex> [output_path]` uses a sliding pool of up to four chunk workers, prefers rare chunks, caps planned concurrent downloads at two per source, and verifies the rebuilt file's SHA-256.
+- [x] User downloads use a private staging folder and do not advertise all downloaded chunks as owned replicas.
+- [x] Each local peer gets a separate chunk directory (`peer_chunks/<port>/`); `P2P_STORE_DIR` can select another base directory.
 - [x] CHUNK_REQUEST carries a start offset and length so a download can resume at the first missing byte; a source change is attempted after three adaptive RTOs without progress.
 - [x] CHUNK_DATA transmission pauses briefly after each eight-fragment burst; the UDP socket requests a 4 MiB receive buffer (the operating system may clamp this value).
 - [x] Live CHUNK_ACK/CHUNK_NAK handling: receivers report cumulative progress and selective fragment receipt; each 32-fragment window gets up to five send rounds, and a missing chunk triggers NOT_STORED.
@@ -46,21 +49,23 @@ These items are implemented in the current code. They still need the live four-p
 - [x] Heartbeats include a CRC-32 membership-view hash; two consecutive mismatches trigger a binary PEER_LIST_REQ and JOIN_ACK snapshot exchange.
 - [x] Bootstrap peers assign joining peer IDs from their currently known active IDs.
 - [x] Membership uses binary JOIN, JOIN_ACK, NEW_PEER, HEARTBEAT, LEAVE, and PEER_LIST_REQ datagrams; JOIN is retried and deduplicated by UDP source address.
+- [x] Bootstrap names are resolved, the advertised LAN address is detected or can be set with `--ip`, and JOIN_ACK peer lists are limited to one datagram.
+- [x] Initial replica requests are retried, failed downloads retry chunks, and re-replication chooses a candidate while avoiding a complete-file copy.
+- [x] Background chat and heartbeat loops continue after a handled send/processing error. Windows UDP ICMP reset errors are disabled when supported.
 - [x] Local screenshots show peers joining and receiving sequential chat messages. Evidence is collected in [the debugging PDF](evidence/p2p_debug_outputs.pdf).
 
 ### Remaining for the full assignment
 
-- [ ] Run a live transfer with packet loss to check FILE_LIST, CHUNK_HASH, and CHUNK_HAVE retries, selective fragment retry, and NOT_STORED failover; save terminal screenshots as evidence.
-- [ ] Corrupt a test chunk or digest and verify the receiver rejects it and tries another owner; save terminal screenshots as evidence.
-- [ ] Run a live four-peer check of catalog exchange, replica placement, download, and the latest Rule 6/7 chat changes; save screenshots as evidence.
-- [x] Replace text membership messages with binary protocol packets; live multi-peer and packet-loss verification remains pending.
-- [ ] Prepare at least two files of 2 MB or larger; split them into fixed-size chunks.
-- [ ] Verify live that each chunk has two owners and no peer's chunk store holds the complete file.
-- [x] Implement automatic re-replication after an owner leaves or times out; live verification remains pending.
-- [x] Let a joining peer take its assigned share of existing chunks; live verification remains pending, and older copies are not deleted.
-- [ ] Demonstrate a multi-source download with chunks coming from at least two peers.
-- [ ] Test source failure during download and continue from another replica.
-- [ ] Demonstrate the application with at least four peers and record measured results and graphs for the report.
+- [ ] Simulate network packet loss and verify FILE_LIST, CHUNK_HASH, CHUNK_HAVE retries and selective fragment retransmission; save screenshots.
+- [ ] Corrupt a stored chunk/digest and verify hash rejection and fallback to a replica; save screenshots.
+- [x] Run the supplied four-peer localhost integration check: membership, chat, two 2.5 MB files, replica count, and no complete-file owner.
+- [ ] Index at least two 2 MB-or-larger files from each participant (the included test indexes two files total).
+- [x] Integration run downloaded a file from multiple source peers and checked its SHA-256.
+- [x] Integration run stopped a source during a download, verified failover and full-file SHA-256, then observed timeout removal and re-replication.
+- [ ] Run the complete demo across four actual participant machines and verify LAN addresses/firewall behavior.
+- [ ] Capture fresh terminal screenshots for the evidence PDF; the automated integration output is not yet in the PDF.
+- [ ] Record performance measurements and graphs for the report.
+- [ ] Finish submission packaging and live demonstration preparation.
 - [ ] Finish submission packaging, run instructions, and live demonstration preparation.
 
 ## Run peer discovery locally
@@ -81,7 +86,19 @@ python p2p_file.py 5002 127.0.0.1:5000
 python p2p_file.py 5003 127.0.0.1:5000
 ```
 
-These commands run peers on one computer. The current advertised address is `127.0.0.1`; peers on separate computers need a reachable LAN address.
+These commands run peers on one computer. For peers on separate computers, use the bootstrap computer's reachable LAN address; use `--ip ADDRESS` to override the detected advertised address. The chunk store is separated by peer port.
+
+## Run the one-command integration checker
+
+From the project directory, run:
+
+```powershell
+python integration_test.py
+```
+
+The checker runs the unit suite, then starts four localhost peers. The integration test indexes two generated 2.5 MB files, checks two owners per chunk with no full-file owner, checks chat, downloads from multiple peers, stops a source during a second download, and checks timeout removal and replica repair. The unit suite also covers protocol validation, placement, and chat-session behavior.
+
+Temporary test stores and files are removed when the checker exits. It chooses four free consecutive UDP ports unless `P2P_TEST_PORT` is set. The test verifies localhost behavior; it does not simulate arbitrary packet loss, test multiple participant files per peer, or provide performance graphs.
 
 In a peer terminal, share a file and inspect the catalog:
 
@@ -133,7 +150,7 @@ The sender maintains an independent ordered chat stream for each recipient, with
 sequenceDiagram
     participant S as Sending peer
     participant R as Receiving peer
-    S->>R: CHAT with packet and chat sequence numbers
+    S->>R: CHAT(session ID, packet sequence, chat sequence, text)
     R->>R: Validate packet and check expected sequence
     alt Expected CHAT
         R->>R: Display once and advance expected counters
@@ -146,7 +163,7 @@ sequenceDiagram
     Note over S,R: If the ACK times out, sender retries the unchanged CHAT
 ```
 
-Rule 6/7 in-memory verification passed. The latest changes still need a live UDP check across peer processes.
+The supplied unit suite checks Rule 6/7 cases, and the four-peer run verified chat delivery without repeated display. Screenshot evidence for this run still needs to be added.
 
 ### File placement and basic download
 
@@ -186,12 +203,12 @@ Measured performance graphs still need real test data. Planned graphs include ch
 
 ## Current limitations
 
-- Membership uses binary packets. Multi-peer, packet-loss, simultaneous-join, and oversized peer-list behavior still need live verification. JOIN_ACK peer lists currently fit in a single datagram only.
-- Placement currently runs when `/index` is entered and needs at least three known peers and two chunks. A file indexed before the group is ready must be indexed again after peers join.
-- CHUNK_ACK/CHUNK_NAK, CHUNK_HASH/CHUNK_HASH_ACK, FILE_LIST/FILE_LIST_ACK, and CHUNK_HAVE/CHUNK_HAVE_ACK are connected to the live transfer loop, but packet-loss recovery, hash mismatch handling, and adaptive failover still need live testing. NOT_STORED and HASH_MISMATCH are the active NAK reasons.
-- Join-time rebalancing retains old replicas. Safe surplus-copy deletion is not implemented because membership views and replacement ownership still need live verification.
-- The peer list and reliability state exist only in memory.
-- The advertised `127.0.0.1` address supports same-computer testing, not communication between separate computers.
+- The integration test covers localhost UDP only. Packet-loss simulation, simultaneous joins, peer-list overflow and real multi-machine LAN behavior still need testing.
+- Assignment-scale indexing from every participant is not covered by the included test; it indexes two files total.
+- Corrupt-chunk rejection has unit/code coverage but has not been demonstrated with an intentionally corrupted live source.
+- Join-time rebalancing retains older replicas. Safe deletion of surplus copies is not implemented.
+- Peer lists, transfer queues, and catalog state are in memory and are rebuilt through peer exchange after restart.
+- Performance measurements and graphs are still needed for the report.
 
 ## Protocol and evidence documents
 

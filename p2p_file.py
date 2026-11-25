@@ -7,6 +7,7 @@ import time
 import struct
 import os
 import hashlib
+import shutil
 import zlib
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -47,6 +48,11 @@ active_replication_tasks = set()
 chunk_placement_state = {}
 pending_chunk_repairs = {}
 chunk_repair_lock = threading.Lock()
+# FIX 3: initial REPLICATE_REQ datagrams waiting for the owner's CHUNK_HAVE.
+pending_initial_replications = {}
+initial_replication_lock = threading.Lock()
+local_port = 0
+advertise_ip = "127.0.0.1"
 
 PACKET_SEQUENCE_MAX = 0xFFFF
 CHAT_SEQUENCE_MAX = 0xFFFFFFFF
@@ -55,6 +61,12 @@ next_chat_sequence_by_peer = {}
 expected_packet_sequence_by_peer = {}
 expected_chat_sequence_by_peer = {}
 received_chat_pairs_by_peer = {}
+# FIX 5: per-direction chat session IDs. A sender picks a fresh random ID
+# whenever it (re)starts a stream to a recipient; a receiver resets its
+# expected counters only when it sees a different session ID.
+outgoing_session_by_peer = {}
+receive_session_by_peer = {}
+retired_sessions_by_peer = {}
 
 HEARTBEAT_INTERVAL = 2
 PEER_TIMEOUT = 6
@@ -65,7 +77,16 @@ INITIAL_RTO = 1.0
 MIN_RTO = 0.2
 MAX_RTO = 3.0
 DEFAULT_CHUNK_SIZE = 256 * 1024
-CHUNK_STORE_DIR = os.path.join(os.path.dirname(__file__), "peer_chunks")
+BASE_STORE_DIR = os.environ.get(
+    "P2P_STORE_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "peer_chunks"),
+)
+CHUNK_STORE_DIR = BASE_STORE_DIR  # replaced by a per-port folder in main()
+# FIX 2: user downloads are staged here, never in the shared chunk store.
+DOWNLOAD_STAGING_DIR = os.path.join(BASE_STORE_DIR, "_download_staging")
+DOWNLOAD_CHUNK_ATTEMPTS = 3
+INITIAL_REPLICATION_RETRY_INTERVAL = 2
+INITIAL_REPLICATION_RETRIES = 10
 CHUNK_FRAGMENT_DATA_SIZE = (
     protocol_design.MAX_DATAGRAM_SIZE - protocol_design.header_size - 44
 )
@@ -82,6 +103,9 @@ CHUNK_HAVE_ACK_TIMEOUT = 1
 CHUNK_HAVE_RETRIES = 5
 CHUNK_REPAIR_RETRY_INTERVAL = CHUNK_REQUEST_TIMEOUT * 2
 MIN_DISTRIBUTION_PEERS = 3
+MAX_JOIN_ACK_PEERS = (
+    protocol_design.MAX_DATAGRAM_SIZE - protocol_design.header_size - 2
+) // 8
 MAX_FILE_LIST_FILENAME_BYTES = (
     protocol_design.MAX_DATAGRAM_SIZE
     - protocol_design.header_size
@@ -254,26 +278,54 @@ def advance_expected_sequences_from(sender_peer_id):
         return packet_sequence, chat_sequence
 
 
+def outgoing_chat_session(destination_peer_id):
+    """Return this sender's session ID for one recipient, creating it once."""
+    key = (peer_id, destination_peer_id)
+    with sequence_lock:
+        session_id = outgoing_session_by_peer.get(key)
+        if session_id is None:
+            session_id = random.randint(1, 0xFFFFFFFF)
+            outgoing_session_by_peer[key] = session_id
+        return session_id
+
+
 def clear_peer_sequence_state(removed_peer_id):
-    """Forget sequence counters in both directions when a peer is removed."""
+    """Forget the outgoing stream to a removed peer.
+
+    FIX 5: only the sending direction is reset (with a new session ID next
+    time). Receive-side counters are kept and keyed by the sender's session
+    ID, so a one-sided timeout can no longer desynchronise the two peers:
+    previously the receiver restarted at 1 while the sender continued at N
+    (chat blocked forever), or the sender restarted at 1 while the receiver
+    expected N (new messages ACKed as "duplicates" and never displayed).
+    """
     with sequence_lock:
         for sequence_map in (
             next_packet_sequence_by_peer,
             next_chat_sequence_by_peer,
-            expected_packet_sequence_by_peer,
-            expected_chat_sequence_by_peer,
-            received_chat_pairs_by_peer,
+            outgoing_session_by_peer,
         ):
-            for peer_pair in tuple(sequence_map):
-                if removed_peer_id in peer_pair:
-                    sequence_map.pop(peer_pair, None)
+            sequence_map.pop((peer_id, removed_peer_id), None)
 
 
-def classify_incoming_chat(sender_peer_id, packet_sequence, chat_sequence):
+def classify_incoming_chat(sender_peer_id, session_id, packet_sequence, chat_sequence):
     """Accept the expected CHAT, recognize exact retransmits, or reject gaps."""
     key = (sender_peer_id, peer_id)
 
     with sequence_lock:
+        retired_sessions = retired_sessions_by_peer.setdefault(key, set())
+        if session_id in retired_sessions:
+            # A delayed datagram from a stream the sender already abandoned.
+            return "reject"
+        current_session = receive_session_by_peer.get(key)
+        if current_session != session_id:
+            # A new sender stream always starts at sequence 1.
+            if current_session is not None:
+                retired_sessions.add(current_session)
+            receive_session_by_peer[key] = session_id
+            expected_packet_sequence_by_peer[key] = 1
+            expected_chat_sequence_by_peer[key] = 1
+            received_chat_pairs_by_peer[key] = {}
         expected_packet = expected_packet_sequence_by_peer.setdefault(key, 1)
         expected_chat = expected_chat_sequence_by_peer.setdefault(key, 1)
         received_pairs = received_chat_pairs_by_peer.setdefault(key, {})
@@ -396,28 +448,50 @@ def plan_chunk_owners(file_id, chunk_count, participant_ids):
         rankings[chunk_index] = (ranked, scores)
         placement[chunk_index] = ranked[:2]
 
-    # If HRW happens to put one peer in every chunk's top two, move its
-    # lowest-scoring assignment to that chunk's third-ranked peer.
-    while True:
-        full_file_owners = [
+    # If HRW puts one peer in every chunk's owner pair, that peer would store
+    # the complete file. FIX 8: the old loop moved one assignment at a time
+    # and, with three peers, could oscillate forever (or raise StopIteration).
+    # Now a move is accepted only if it strictly reduces the number of
+    # full-file owners, so the loop always terminates. An improving move
+    # always exists for >= 3 peers and >= 3 chunks.
+    def full_file_owners(candidate_placement):
+        return [
             known_id
             for known_id in participant_ids
-            if all(known_id in owners for owners in placement.values())
+            if all(known_id in owners for owners in candidate_placement.values())
         ]
-        if not full_file_owners:
-            break
 
-        known_id = full_file_owners[0]
-        lowest_chunk = min(
-            placement,
-            key=lambda index: rankings[index][1][known_id],
-        )
-        ranked, _ = rankings[lowest_chunk]
-        other_owner = next(
-            owner for owner in placement[lowest_chunk] if owner != known_id
-        )
-        replacement = next(owner for owner in ranked[2:] if owner != other_owner)
-        placement[lowest_chunk] = (other_owner, replacement)
+    current_full = full_file_owners(placement)
+    while current_full:
+        improved = False
+        for known_id in current_full:
+            # Try X's weakest assignments first, and the best-ranked
+            # replacement peers first, to stay close to the HRW result.
+            for chunk_index in sorted(
+                placement, key=lambda index: rankings[index][1][known_id]
+            ):
+                ranked, _ = rankings[chunk_index]
+                other_owner = next(
+                    owner for owner in placement[chunk_index] if owner != known_id
+                )
+                for replacement in ranked:
+                    if replacement in (known_id, other_owner):
+                        continue
+                    trial = dict(placement)
+                    trial[chunk_index] = (other_owner, replacement)
+                    trial_full = full_file_owners(trial)
+                    if len(trial_full) < len(current_full):
+                        placement, current_full = trial, trial_full
+                        improved = True
+                        break
+                if improved:
+                    break
+            if improved:
+                break
+        if not improved:
+            raise ValueError(
+                "Could not place chunks without one peer holding the whole file"
+            )
 
     return placement
 
@@ -472,10 +546,58 @@ def distribute_file_chunks(file_id):
                 seq_no=0,
                 payload=(file_id, chunk_index),
             )
+            # FIX 3: keep the request until the owner announces CHUNK_HAVE,
+            # and let retry_initial_replications() resend it if it is lost.
+            with initial_replication_lock:
+                pending_initial_replications[(file_id, chunk_index, owner_id)] = {
+                    "addr": owner_addr,
+                    "datagram": request_datagram,
+                    "last_sent": time.monotonic(),
+                    "retries": 0,
+                }
             server.sendto(request_datagram, owner_addr)
             requests_sent += 1
 
     return requests_sent
+
+
+def retry_initial_replications():
+    """Resend initial REPLICATE_REQ datagrams whose owner has not confirmed.
+
+    FIX 3: the original code sent each initial REPLICATE_REQ once. If both
+    requests for a chunk were lost, the catalog listed no owner and the
+    chunk existed only as an unlisted staged copy on the indexing peer.
+    """
+    now = time.monotonic()
+    active_ids = {known_id for known_id, _ in peer_snapshot()}
+    due = []
+    with initial_replication_lock:
+        for key, state in tuple(pending_initial_replications.items()):
+            file_id, chunk_index, owner_id = key
+            with file_catalog_lock:
+                metadata = file_catalog_state.get(file_id)
+                confirmed = (
+                    metadata is not None
+                    and owner_id in metadata["chunk_owners"].get(chunk_index, ())
+                )
+            if confirmed or owner_id not in active_ids:
+                pending_initial_replications.pop(key, None)
+                continue
+            if now - state["last_sent"] < INITIAL_REPLICATION_RETRY_INTERVAL:
+                continue
+            if state["retries"] >= INITIAL_REPLICATION_RETRIES:
+                pending_initial_replications.pop(key, None)
+                continue
+            state["retries"] += 1
+            state["last_sent"] = now
+            due.append((state["datagram"], state["addr"]))
+
+    for datagram, destination_addr in due:
+        try:
+            server.sendto(datagram, destination_addr)
+        except OSError:
+            pass
+    return len(due)
 
 
 def repair_under_replicated_chunks():
@@ -509,12 +631,36 @@ def repair_under_replicated_chunks():
 
         # Every peer sees the departure; the lowest surviving owner coordinates
         # the repair so the group does not start duplicate transfers.
-        if not owners or peer_id != min(owners):
+        # FIX 3: when no listed owner is left, a peer that still holds a
+        # staged (unlisted) copy, normally the indexer, coordinates instead.
+        has_local_copy = chunk_store.has_chunk(CHUNK_STORE_DIR, file_id, chunk_index)
+        if owners:
+            if peer_id != min(owners):
+                continue
+        elif not has_local_copy:
             continue
-        if not chunk_store.has_chunk(CHUNK_STORE_DIR, file_id, chunk_index):
+        if not has_local_copy:
             continue
 
-        candidates = sorted(known_peer_ids - owners - {peer_id})
+        # FIX 10: prefer the candidate holding the fewest chunks of this file
+        # and never one that would then hold every chunk, instead of always
+        # picking the lowest peer ID (which concentrated whole files).
+        with file_catalog_lock:
+            file_metadata = file_catalog_state.get(file_id)
+            chunk_total = file_metadata["chunk_count"] if file_metadata else 0
+            held_counts = {}
+            if file_metadata is not None:
+                for other_owners in file_metadata["chunk_owners"].values():
+                    for owner in other_owners:
+                        held_counts[owner] = held_counts.get(owner, 0) + 1
+        candidates = sorted(
+            (
+                candidate
+                for candidate in known_peer_ids - owners - {peer_id}
+                if held_counts.get(candidate, 0) + 1 < chunk_total
+            ),
+            key=lambda candidate: (held_counts.get(candidate, 0), candidate),
+        )
         if not candidates:
             continue
 
@@ -610,7 +756,16 @@ def rebalance_chunks_for_local_peer():
 
     tasks_started = 0
     for file_id, chunk_count, known_hash_indices, chunk_owners in file_entries:
-        placement = plan_chunk_owners(file_id, chunk_count, participants)
+        # FIX 8: a one-chunk file has no distributed placement. Calling
+        # plan_chunk_owners for it raised ValueError and aborted rebalancing
+        # for every file listed after it in the catalog.
+        if chunk_count < 2:
+            continue
+        try:
+            placement = plan_chunk_owners(file_id, chunk_count, participants)
+        except (ValueError, StopIteration) as error:
+            print(f"Skipping rebalance of {file_id.hex()[:8]}: {error}")
+            continue
         for chunk_index, designated_owners in placement.items():
             if peer_id not in designated_owners:
                 continue
@@ -620,9 +775,14 @@ def rebalance_chunks_for_local_peer():
                 continue
 
             if chunk_store.has_chunk(CHUNK_STORE_DIR, file_id, chunk_index):
-                announce_chunk_have(file_id, chunk_index)
+                # FIX 16: a temporary indexer copy is deleted later, so it
+                # must not be announced as a permanent replica.
+                if not is_staged_copy(file_id, chunk_index):
+                    announce_chunk_have(file_id, chunk_index)
                 continue
             if not chunk_owners[chunk_index]:
+                continue
+            if would_hold_full_file(file_id, chunk_index):
                 continue
 
             task_key = (file_id, chunk_index, peer_id)
@@ -930,7 +1090,9 @@ def send_chunk_data(
             protocol_version=protocol_design.PROTOCOL_VERSION,
             flags=0,
             group_id=0,
-            seq_no=(fragment_offset // CHUNK_FRAGMENT_DATA_SIZE) & 0xFFFF,
+            # FIX 7: the spec requires seq_no = 0 for every non-CHAT packet;
+            # the fragment position is already carried in fragment_offset.
+            seq_no=0,
             payload=(file_id, chunk_index, fragment_offset, total_chunk_size, fragment_data),
         )
         fragments.append((fragment_offset, datagram))
@@ -982,10 +1144,23 @@ def send_chunk_data(
                             time.sleep(0.001)
                             sent_in_burst = 0
 
-                send_state["event"].wait(get_peer_rto(destination_id))
-                with chunk_send_lock:
-                    if send_state["error"] is not None:
-                        return
+                # FIX 4: wait until the whole window is acknowledged or one
+                # full RTO has passed. The old single event.wait() returned
+                # on the first CHUNK_ACK, so the next "round" resent every
+                # fragment whose ACK was still in flight and burned all five
+                # rounds in a few milliseconds.
+                deadline = time.monotonic() + get_peer_rto(destination_id)
+                while True:
+                    with chunk_send_lock:
+                        if send_state["error"] is not None:
+                            return
+                        if window_offsets.issubset(send_state["acked"]):
+                            break
+                        send_state["event"].clear()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    send_state["event"].wait(remaining)
 
             with chunk_send_lock:
                 window_complete = window_offsets.issubset(send_state["acked"])
@@ -1016,8 +1191,18 @@ def request_chunk(
     source_loads=None,
     source_load_lock=None,
     source_reservation=None,
+    store_dir=None,
+    announce=True,
 ):
-    """Request a chunk, resume at the first missing byte, and fail over quickly."""
+    """Request a chunk, resume at the first missing byte, and fail over quickly.
+
+    ``store_dir`` selects where the verified chunk is written. Replica and
+    rebalance transfers use the shared chunk store and announce CHUNK_HAVE;
+    a user download (FIX 2) writes to a private staging folder and passes
+    ``announce=False`` so the downloader never becomes a full-file owner.
+    """
+    if store_dir is None:
+        store_dir = CHUNK_STORE_DIR
     with file_catalog_lock:
         metadata = file_catalog_state.get(file_id)
         if metadata is None:
@@ -1032,8 +1217,8 @@ def request_chunk(
     if expected_chunk_hash is None:
         raise ValueError("Expected chunk hash has not arrived from the catalog")
 
-    if chunk_store.has_chunk(CHUNK_STORE_DIR, file_id, chunk_index):
-        if preferred_owner_id is not None:
+    if chunk_store.has_chunk(store_dir, file_id, chunk_index):
+        if preferred_owner_id is not None and announce:
             announce_chunk_have(file_id, chunk_index)
         return True
 
@@ -1069,6 +1254,7 @@ def request_chunk(
         "error": None,
         "error_reason": None,
         "last_progress": time.monotonic(),
+        "store_dir": store_dir,
     }
 
     with chunk_download_lock:
@@ -1076,8 +1262,15 @@ def request_chunk(
             raise ValueError("This chunk is already being downloaded")
         pending_chunk_downloads[key] = download_state
 
+    # FIX 9: an owner skipped because it already serves two chunks is
+    # queued again at the end with the load cap lifted, so a busy replica is
+    # still used as the last resort instead of failing the chunk outright.
+    attempt_queue = [(owner_id, True) for owner_id in owners]
+    attempt_index = 0
     try:
-        for owner_id in owners:
+        while attempt_index < len(attempt_queue):
+            owner_id, respect_load_cap = attempt_queue[attempt_index]
+            attempt_index += 1
             if owner_id == peer_id or owner_id not in peer_addresses:
                 continue
 
@@ -1090,7 +1283,8 @@ def request_chunk(
                         else None
                     )
                     if reserved_owner_id != owner_id:
-                        if source_loads.get(owner_id, 0) >= 2:
+                        if respect_load_cap and source_loads.get(owner_id, 0) >= 2:
+                            attempt_queue.append((owner_id, False))
                             continue
                         if reserved_owner_id is not None:
                             source_loads[reserved_owner_id] = max(
@@ -1106,6 +1300,10 @@ def request_chunk(
                 download_state["owner_addr"] = owner_addr
                 download_state["error"] = None
                 download_state["error_reason"] = None
+                # FIX 1: give every new owner its own no-progress budget.
+                # Without this reset, the previous owner's stale timestamp
+                # made the loop give up on the replica before asking it.
+                download_state["last_progress"] = time.monotonic()
                 download_state["event"].clear()
 
             while True:
@@ -1120,7 +1318,8 @@ def request_chunk(
 
                 if download_state["event"].is_set():
                     if current_error is None:
-                        announce_chunk_have(file_id, chunk_index)
+                        if announce:
+                            announce_chunk_have(file_id, chunk_index)
                         return (
                             source_reservation.get("owner_id", owner_id)
                             if source_reservation is not None
@@ -1174,6 +1373,57 @@ def replicate_chunk_from_peer(file_id, chunk_index, owner_id, owner_addr):
             active_replication_tasks.discard(task_key)
 
 
+def local_chunk_indices(file_id):
+    """Return the chunk indices of one file stored in this peer's chunk store."""
+    folder = os.path.join(CHUNK_STORE_DIR, file_id.hex())
+    if not os.path.isdir(folder):
+        return set()
+    indices = set()
+    for name in os.listdir(folder):
+        if name.endswith(".chunk"):
+            try:
+                indices.add(int(name.split(".")[0], 16))
+            except ValueError:
+                pass
+    return indices
+
+
+def is_staged_copy(file_id, chunk_index):
+    """True for a temporary indexer copy that is not one of its assignments."""
+    placement = chunk_placement_state.get(file_id)
+    return bool(placement) and chunk_index in placement and (
+        peer_id not in placement[chunk_index]
+    )
+
+
+def would_hold_full_file(file_id, chunk_index):
+    """FIX 16: True if storing this chunk would give this peer the whole file.
+
+    Counts stored chunks (minus temporary indexer copies) plus transfers
+    already in progress. Join rebalancing keeps older replicas, so two
+    slightly different membership views could otherwise add up to a full
+    file on one peer, breaking "no single peer holds a complete file".
+    """
+    with file_catalog_lock:
+        metadata = file_catalog_state.get(file_id)
+        if metadata is None:
+            return False
+        chunk_count = metadata["chunk_count"]
+    held = {
+        index
+        for index in local_chunk_indices(file_id)
+        if not is_staged_copy(file_id, index)
+    }
+    with chunk_download_lock:
+        held.update(
+            index
+            for task_file_id, index, _ in active_replication_tasks
+            if task_file_id == file_id
+        )
+    held.add(chunk_index)
+    return chunk_count >= 2 and len(held) >= chunk_count
+
+
 def start_replication_request(file_id, chunk_index, owner_id, owner_addr):
     """Start a requested replica transfer once file metadata is available."""
     with file_catalog_lock:
@@ -1183,6 +1433,16 @@ def start_replication_request(file_id, chunk_index, owner_id, owner_addr):
                 (file_id, chunk_index, owner_id, owner_addr)
             )
             return
+
+    if (
+        not chunk_store.has_chunk(CHUNK_STORE_DIR, file_id, chunk_index)
+        and would_hold_full_file(file_id, chunk_index)
+    ):
+        print(
+            f"Declined replica of chunk {chunk_index} of {file_id.hex()[:8]}: "
+            "it would put the complete file on this peer"
+        )
+        return
 
     task_key = (file_id, chunk_index, owner_id)
     with chunk_download_lock:
@@ -1210,6 +1470,9 @@ def maybe_release_staged_chunk(file_id, chunk_index):
     with file_catalog_lock:
         actual_owners = file_catalog_state[file_id]["chunk_owners"][chunk_index]
         all_replicas_reported = expected_owners.issubset(actual_owners)
+        # FIX 16: never delete a copy this peer has announced as its own.
+        if peer_id in actual_owners:
+            return False
 
     if all_replicas_reported:
         return chunk_store.delete_chunk(CHUNK_STORE_DIR, file_id, chunk_index)
@@ -1224,6 +1487,7 @@ def download_one_chunk(
     source_loads,
     source_load_lock,
     source_reservation,
+    staging_dir,
 ):
     """Worker used by download_file to fetch one chunk independently."""
     try:
@@ -1234,126 +1498,180 @@ def download_one_chunk(
             source_loads=source_loads,
             source_load_lock=source_load_lock,
             source_reservation=source_reservation,
+            store_dir=staging_dir,
+            announce=False,
         )
     except Exception as error:
         errors[chunk_index] = str(error)
         return None
 
 
+def current_chunk_owners(file_id, chunk_count):
+    """Return a fresh snapshot of the catalog's owners for every chunk."""
+    with file_catalog_lock:
+        metadata = file_catalog_state[file_id]
+        return {
+            chunk_index: tuple(metadata["chunk_owners"][chunk_index])
+            for chunk_index in range(chunk_count)
+        }
+
+
 def download_file(file_id, destination_path):
-    """Fetch chunks in parallel, rebuild the file, and verify its SHA-256 ID."""
+    """Fetch chunks in parallel, rebuild the file, and verify its SHA-256 ID.
+
+    FIX 2: downloaded chunks go to a private staging folder that is deleted
+    after assembly. They are never written to the shared chunk store and
+    never announced with CHUNK_HAVE, so a downloader does not become an
+    owner of every chunk (which would put a complete file on one peer).
+
+    FIX 9: a chunk that fails is retried up to DOWNLOAD_CHUNK_ATTEMPTS times
+    with a fresh owner snapshot, so a replica that appears later (repair) or
+    a busy source can still finish the file.
+    """
     with file_catalog_lock:
         metadata = file_catalog_state.get(file_id)
         if metadata is None:
             raise ValueError("File ID is not in the catalog")
         chunk_count = metadata["chunk_count"]
         filename = metadata["filename"]
-        owners_by_chunk = {
-            chunk_index: tuple(metadata["chunk_owners"][chunk_index])
-            for chunk_index in range(chunk_count)
-        }
+
+    owners_by_chunk = current_chunk_owners(file_id, chunk_count)
 
     if not destination_path:
         destination_path = os.path.join("downloads", filename)
 
-    errors = {}
-    missing_chunks = [
-        chunk_index
-        for chunk_index in range(chunk_count)
-        if not chunk_store.has_chunk(CHUNK_STORE_DIR, file_id, chunk_index)
-    ]
-    source_loads = {}
-    source_load_lock = threading.Lock()
-    active = {}
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        while missing_chunks or active:
-            while missing_chunks and len(active) < 4:
-                with source_load_lock:
-                    available = [
-                        chunk_index
-                        for chunk_index in missing_chunks
-                        if any(
-                            source_loads.get(owner_id, 0) < 2
-                            for owner_id in owners_by_chunk[chunk_index]
-                        )
-                    ]
-                    if not available:
-                        break
-                    rarest_count = min(
-                        len(owners_by_chunk[chunk_index])
-                        for chunk_index in available
-                    )
-                    rarest = [
-                        chunk_index
-                        for chunk_index in available
-                        if len(owners_by_chunk[chunk_index]) == rarest_count
-                    ]
-                    chunk_index = random.choice(rarest)
-                    owner_order = tuple(
-                        owner_id
-                        for owner_id in sorted(
-                            owners_by_chunk[chunk_index],
-                            key=lambda owner_id: (
-                                source_loads.get(owner_id, 0),
-                                random.random(),
-                            ),
-                        )
-                        if source_loads.get(owner_id, 0) < 2
-                    )
-                    primary_owner = owner_order[0] if owner_order else None
-                    if primary_owner is not None:
-                        source_loads[primary_owner] = (
-                            source_loads.get(primary_owner, 0) + 1
-                        )
-                if primary_owner is None:
-                    missing_chunks.remove(chunk_index)
-                    errors[chunk_index] = "No known chunk owners"
-                    continue
-                source_reservation = {"owner_id": primary_owner}
-                future = executor.submit(
-                    download_one_chunk,
+    staging_dir = os.path.join(
+        DOWNLOAD_STAGING_DIR,
+        f"{local_port}-{file_id.hex()[:16]}-{time.time_ns()}",
+    )
+
+    try:
+        # Chunks this peer already owns are copied into the staging folder
+        # so the shared store keeps only this peer's assigned share.
+        missing_chunks = []
+        for chunk_index in range(chunk_count):
+            if chunk_store.has_chunk(CHUNK_STORE_DIR, file_id, chunk_index):
+                chunk_store.store_chunk(
+                    staging_dir,
                     file_id,
                     chunk_index,
-                    errors,
-                    owner_order,
-                    source_loads,
-                    source_load_lock,
-                    source_reservation,
+                    chunk_store.load_chunk(CHUNK_STORE_DIR, file_id, chunk_index),
                 )
-                active[future] = (chunk_index, source_reservation)
-                missing_chunks.remove(chunk_index)
+            else:
+                missing_chunks.append(chunk_index)
 
-            if not active:
-                for chunk_index in missing_chunks:
-                    errors[chunk_index] = "No available peer owns this chunk"
-                break
-
-            completed, _ = wait(active, return_when=FIRST_COMPLETED)
-            for future in completed:
-                chunk_index, source_reservation = active.pop(future)
-                actual_owner = future.result()
-                reserved_owner_id = source_reservation.get("owner_id")
-                if reserved_owner_id is not None:
+        errors = {}
+        attempts = {chunk_index: 0 for chunk_index in missing_chunks}
+        source_loads = {}
+        source_load_lock = threading.Lock()
+        active = {}
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            while missing_chunks or active:
+                while missing_chunks and len(active) < 4:
                     with source_load_lock:
-                        source_loads[reserved_owner_id] = max(
-                            0,
-                            source_loads.get(reserved_owner_id, 1) - 1,
+                        available = [
+                            chunk_index
+                            for chunk_index in missing_chunks
+                            if any(
+                                source_loads.get(owner_id, 0) < 2
+                                for owner_id in owners_by_chunk[chunk_index]
+                            )
+                        ]
+                        if not available:
+                            break
+                        rarest_count = min(
+                            len(owners_by_chunk[chunk_index])
+                            for chunk_index in available
                         )
-                if actual_owner is None and chunk_index not in errors:
-                    errors[chunk_index] = "No peer delivered this chunk"
+                        rarest = [
+                            chunk_index
+                            for chunk_index in available
+                            if len(owners_by_chunk[chunk_index]) == rarest_count
+                        ]
+                        chunk_index = random.choice(rarest)
+                        owner_order = tuple(
+                            owner_id
+                            for owner_id in sorted(
+                                owners_by_chunk[chunk_index],
+                                key=lambda owner_id: (
+                                    source_loads.get(owner_id, 0),
+                                    random.random(),
+                                ),
+                            )
+                            if source_loads.get(owner_id, 0) < 2
+                        )
+                        primary_owner = owner_order[0] if owner_order else None
+                        if primary_owner is not None:
+                            source_loads[primary_owner] = (
+                                source_loads.get(primary_owner, 0) + 1
+                            )
+                    if primary_owner is None:
+                        missing_chunks.remove(chunk_index)
+                        errors[chunk_index] = "No known chunk owners"
+                        continue
+                    attempts[chunk_index] += 1
+                    errors.pop(chunk_index, None)
+                    source_reservation = {"owner_id": primary_owner}
+                    future = executor.submit(
+                        download_one_chunk,
+                        file_id,
+                        chunk_index,
+                        errors,
+                        owner_order,
+                        source_loads,
+                        source_load_lock,
+                        source_reservation,
+                        staging_dir,
+                    )
+                    active[future] = (chunk_index, source_reservation)
+                    missing_chunks.remove(chunk_index)
 
-    if errors:
-        chunk_index = min(errors)
-        raise TimeoutError(
-            f"Could not download chunk {chunk_index}: {errors[chunk_index]}"
+                if not active:
+                    for chunk_index in missing_chunks:
+                        errors[chunk_index] = "No available peer owns this chunk"
+                    break
+
+                completed, _ = wait(active, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    chunk_index, source_reservation = active.pop(future)
+                    actual_owner = future.result()
+                    reserved_owner_id = source_reservation.get("owner_id")
+                    if reserved_owner_id is not None:
+                        with source_load_lock:
+                            source_loads[reserved_owner_id] = max(
+                                0,
+                                source_loads.get(reserved_owner_id, 1) - 1,
+                            )
+                    if actual_owner is None:
+                        if attempts[chunk_index] < DOWNLOAD_CHUNK_ATTEMPTS:
+                            # Refresh owners: a crashed peer may have been
+                            # removed and a repaired replica announced.
+                            owners_by_chunk = current_chunk_owners(
+                                file_id, chunk_count
+                            )
+                            missing_chunks.append(chunk_index)
+                            print(
+                                f"Retrying chunk {chunk_index} "
+                                f"(attempt {attempts[chunk_index] + 1} of "
+                                f"{DOWNLOAD_CHUNK_ATTEMPTS})"
+                            )
+                        elif chunk_index not in errors:
+                            errors[chunk_index] = "No peer delivered this chunk"
+
+        if errors:
+            chunk_index = min(errors)
+            raise TimeoutError(
+                f"Could not download chunk {chunk_index}: {errors[chunk_index]}"
+            )
+
+        return chunk_store.assemble_file(
+            staging_dir,
+            file_id,
+            chunk_count,
+            destination_path,
         )
-
-    return chunk_store.assemble_file(
-        CHUNK_STORE_DIR,
-        file_id,
-        chunk_count,
-        destination_path,
-    )
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 def announce_chunk_have(file_id, chunk_index):
@@ -1407,7 +1725,7 @@ def show_file_catalog():
 def queue_group_chat(text):
     """Queue this chat separately for every peer currently in the group."""
     # Validate the UTF-8 byte limit before placing the message in any queue.
-    protocol_design.make_chat_payload(1, text)
+    protocol_design.make_chat_payload(1, 1, text)
     if peer_id == 0 or not joined_network:
         print("Waiting to join the peer network before sending chat.")
         return
@@ -1429,56 +1747,68 @@ def clear_pending_chat(removed_peer_id):
         queue_for_peer = outgoing_chat_queues.pop(removed_peer_id, deque())
         pending = pending_chats.pop(removed_peer_id, {})
 
-    if pending is not None or queue_for_peer:
+    # FIX 13: only report a failure when chat was actually outstanding.
+    if pending or queue_for_peer:
         print(f"Chat delivery to peer {removed_peer_id} failed; peer was removed")
 
 
 def chat_sender():
-    """Keep an eight-message per-peer window and retry each message by its RTO."""
+    """Run chat_sender_once forever (FIX 11: survive unexpected errors)."""
     while True:
-        now = time.monotonic()
-
-        for destination_id, destination_addr in peer_snapshot():
-            datagrams_to_send = []
-
-            with chat_state_lock:
-                pending_by_sequence = pending_chats.setdefault(destination_id, {})
-                for pending in pending_by_sequence.values():
-                    if now - pending["sent_at"] >= pending["timeout"]:
-                        pending["sent_at"] = now
-                        pending["retransmitted"] = True
-                        pending["timeout"] = min(MAX_RTO, pending["timeout"] * 2)
-                        datagrams_to_send.append(pending["datagram"])
-
-                queue_for_peer = outgoing_chat_queues.get(destination_id)
-                while queue_for_peer and len(pending_by_sequence) < CHAT_WINDOW:
-                    text = queue_for_peer.popleft()
-                    packet_sequence = next_packet_sequence(destination_id)
-                    chat_sequence = next_chat_sequence(destination_id)
-                    datagram_to_send = protocol_design.make_datagram(
-                        packet_name="CHAT",
-                        peer_id=peer_id,
-                        destination_p_id=destination_id,
-                        protocol_version=protocol_design.PROTOCOL_VERSION,
-                        flags=0,
-                        group_id=0,
-                        seq_no=packet_sequence,
-                        payload=(chat_sequence, text),
-                    )
-                    pending_by_sequence[packet_sequence] = {
-                            "seq_no": packet_sequence,
-                        "datagram": datagram_to_send,
-                        "addr": destination_addr,
-                        "sent_at": now,
-                        "timeout": get_peer_rto(destination_id),
-                        "retransmitted": False,
-                    }
-                    datagrams_to_send.append(datagram_to_send)
-
-            for datagram_to_send in datagrams_to_send:
-                server.sendto(datagram_to_send, destination_addr)
-
+        try:
+            chat_sender_once()
+        except Exception as error:
+            print(f"Chat sender cycle failed: {error}")
         time.sleep(0.05)
+
+
+def chat_sender_once():
+    """Keep an eight-message per-peer window and retry each message by its RTO."""
+    now = time.monotonic()
+
+    for destination_id, destination_addr in peer_snapshot():
+        datagrams_to_send = []
+
+        with chat_state_lock:
+            pending_by_sequence = pending_chats.setdefault(destination_id, {})
+            for pending in pending_by_sequence.values():
+                if now - pending["sent_at"] >= pending["timeout"]:
+                    pending["sent_at"] = now
+                    pending["retransmitted"] = True
+                    pending["timeout"] = min(MAX_RTO, pending["timeout"] * 2)
+                    datagrams_to_send.append(pending["datagram"])
+
+            queue_for_peer = outgoing_chat_queues.get(destination_id)
+            while queue_for_peer and len(pending_by_sequence) < CHAT_WINDOW:
+                text = queue_for_peer.popleft()
+                session_id = outgoing_chat_session(destination_id)
+                packet_sequence = next_packet_sequence(destination_id)
+                chat_sequence = next_chat_sequence(destination_id)
+                datagram_to_send = protocol_design.make_datagram(
+                    packet_name="CHAT",
+                    peer_id=peer_id,
+                    destination_p_id=destination_id,
+                    protocol_version=protocol_design.PROTOCOL_VERSION,
+                    flags=0,
+                    group_id=0,
+                    seq_no=packet_sequence,
+                    payload=(session_id, chat_sequence, text),
+                )
+                pending_by_sequence[packet_sequence] = {
+                        "seq_no": packet_sequence,
+                    "datagram": datagram_to_send,
+                    "addr": destination_addr,
+                    "sent_at": now,
+                    "timeout": get_peer_rto(destination_id),
+                    "retransmitted": False,
+                }
+                datagrams_to_send.append(datagram_to_send)
+
+        for datagram_to_send in datagrams_to_send:
+            try:
+                server.sendto(datagram_to_send, destination_addr)
+            except OSError:
+                pass
 
 
 def chat_input():
@@ -1569,6 +1899,9 @@ def join_ack(joiner_addr, joining_id):
     for known_id, known_addr in peer_snapshot():
         if known_id != joining_id:
             entries.append((known_id, known_addr[0], known_addr[1]))
+    # FIX 12: one JOIN_ACK holds at most 125 peer records (1,024-byte limit).
+    # Peers left out still introduce themselves through NEW_PEER/HEARTBEAT.
+    entries = entries[:MAX_JOIN_ACK_PEERS]
 
     datagram = protocol_design.make_datagram(
         packet_name="JOIN_ACK",
@@ -1613,6 +1946,12 @@ def retry_join(datagram, bootstrap_addr):
             server.sendto(datagram, bootstrap_addr)
         except OSError:
             return
+    time.sleep(JOIN_ACK_TIMEOUT)
+    if not joined_network:
+        print(
+            f"No JOIN_ACK from {bootstrap_addr[0]}:{bootstrap_addr[1]}; "
+            "check the bootstrap address and restart this peer."
+        )
 
 
 def leave(peer_id):
@@ -1634,42 +1973,58 @@ def leave(peer_id):
 
 
 def heartbeat():
+    """Run heartbeat_once forever; one failure must not stop heartbeats.
+
+    FIX 11: the old loop had no exception handling, so a single unexpected
+    error ended the thread and every other peer then timed this peer out.
+    """
     while True:
-        if not joined_network or peer_id == 0:
-            time.sleep(HEARTBEAT_INTERVAL)
-            continue
-
-        peer_count, view_hash = peer_view_hash()
-
-        for known_id, peer_addr in peer_snapshot():
-            datagram = protocol_design.make_datagram(
-                packet_name="HEARTBEAT",
-                peer_id=peer_id,
-                destination_p_id=known_id,
-                protocol_version=protocol_design.PROTOCOL_VERSION,
-                flags=0,
-                group_id=0,
-                seq_no=0,
-                payload=(peer_count, view_hash),
-            )
-            server.sendto(datagram, peer_addr)
-
-        now = time.monotonic()
-
-        expired_ids = [
-            known_id
-            for known_id, peer_addr in peer_snapshot()
-            if known_id in last_seen
-            and now - last_seen[known_id] > PEER_TIMEOUT
-        ]
-
-        for expired_id in expired_ids:
-            remove_peer(expired_id)
-            last_seen.pop(expired_id, None)
-            print(f"Peer {expired_id} timed out and was removed")
-
-        repair_under_replicated_chunks()
+        try:
+            heartbeat_once()
+        except Exception as error:
+            print(f"Heartbeat cycle failed: {error}")
         time.sleep(HEARTBEAT_INTERVAL)
+
+
+def heartbeat_once():
+    """Send one round of heartbeats, expire silent peers, and run repairs."""
+    if not joined_network or peer_id == 0:
+        return
+
+    peer_count, view_hash = peer_view_hash()
+
+    for known_id, peer_addr in peer_snapshot():
+        datagram = protocol_design.make_datagram(
+            packet_name="HEARTBEAT",
+            peer_id=peer_id,
+            destination_p_id=known_id,
+            protocol_version=protocol_design.PROTOCOL_VERSION,
+            flags=0,
+            group_id=0,
+            seq_no=0,
+            payload=(peer_count, view_hash),
+        )
+        try:
+            server.sendto(datagram, peer_addr)
+        except OSError:
+            pass
+
+    now = time.monotonic()
+
+    expired_ids = [
+        known_id
+        for known_id, peer_addr in peer_snapshot()
+        if known_id in last_seen
+        and now - last_seen[known_id] > PEER_TIMEOUT
+    ]
+
+    for expired_id in expired_ids:
+        remove_peer(expired_id)
+        last_seen.pop(expired_id, None)
+        print(f"Peer {expired_id} timed out and was removed")
+
+    repair_under_replicated_chunks()
+    retry_initial_replications()
 
 
 def handle_membership_packet(message, addr):
@@ -1759,7 +2114,9 @@ def handle_membership_packet(message, addr):
             peer_id = destination_id
             added_peers = []
             for known_id, known_ip, known_port in peer_records:
-                known_addr = (known_ip, known_port)
+                # FIX 6: the responder's own record may advertise 127.0.0.1;
+                # trust the UDP source address it actually replied from.
+                known_addr = addr if known_id == sender_id else (known_ip, known_port)
                 if known_id != peer_id and add_peer(known_id, known_addr):
                     last_seen[known_id] = time.monotonic()
                     added_peers.append((known_id, known_addr))
@@ -1786,6 +2143,7 @@ def handle_membership_packet(message, addr):
                 (known_id, known_addr[0], known_addr[1])
                 for known_id, known_addr in peer_snapshot()
             )
+            peer_records = peer_records[:MAX_JOIN_ACK_PEERS]  # FIX 12
             response = protocol_design.make_datagram(
                 packet_name="JOIN_ACK",
                 peer_id=peer_id,
@@ -1837,7 +2195,8 @@ def handle_membership_packet(message, addr):
             peer_records = protocol_design.check_datagram(message, show_output=False)
             added_peers = []
             for known_id, known_ip, known_port in peer_records:
-                known_addr = (known_ip, known_port)
+                # FIX 6: use the responder's real UDP source address.
+                known_addr = addr if known_id == sender_id else (known_ip, known_port)
                 if known_id != peer_id and add_peer(known_id, known_addr):
                     last_seen[known_id] = time.monotonic()
                     added_peers.append((known_id, known_addr))
@@ -1894,7 +2253,7 @@ def handle_protocol_chat_or_ack(message, addr):
             packet_sequence = fields[6]
 
             # Validate version, checksum, header/payload lengths, and UTF-8.
-            chat_sequence, chat_text = protocol_design.check_datagram(
+            session_id, chat_sequence, chat_text = protocol_design.check_datagram(
                 message,
                 show_output=False,
             )
@@ -1909,6 +2268,7 @@ def handle_protocol_chat_or_ack(message, addr):
 
             status = classify_incoming_chat(
                 sender_id,
+                session_id,
                 packet_sequence,
                 chat_sequence,
             )
@@ -2414,7 +2774,7 @@ def handle_chunk_transfer(message, addr):
                     return True
 
                 chunk_store.store_chunk(
-                    CHUNK_STORE_DIR,
+                    state["store_dir"],
                     file_id,
                     chunk_index,
                     rebuilt_chunk,
@@ -2516,19 +2876,55 @@ def test_peer_helpers():
         second_receiver.close()
 
 
+def detect_advertise_ip(bootstrap):
+    """Return the local IPv4 address used to reach the bootstrap (FIX 6)."""
+    if bootstrap is None:
+        return "127.0.0.1"
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(bootstrap)  # UDP connect sends nothing
+        return probe.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        probe.close()
+
+
 def main():
     global server, local_port, bootstrap_addr
     global advertise_ip, peer_id, joined_network
 
-    local_port = int(sys.argv[1])
+    arguments = sys.argv[1:]
+    run_self_test = "--selftest" in arguments
+    arguments = [argument for argument in arguments if argument != "--selftest"]
+    explicit_ip = None
+    if "--ip" in arguments:
+        ip_index = arguments.index("--ip")
+        if ip_index + 1 >= len(arguments):
+            raise SystemExit("Usage: python p2p_file.py PORT [HOST:PORT] [--ip ADDRESS] [--selftest]")
+        explicit_ip = arguments[ip_index + 1]
+        del arguments[ip_index:ip_index + 2]
+    if not arguments:
+        raise SystemExit("Usage: python p2p_file.py PORT [HOST:PORT] [--ip ADDRESS] [--selftest]")
+
+    local_port = int(arguments[0])
+    # FIX 15: every peer gets its own chunk store. With one shared
+    # peer_chunks/ folder, peers started from the same directory saw each
+    # other's files, so has_chunk() was true everywhere and the distributed
+    # storage, replication and failover paths were never really exercised.
+    global CHUNK_STORE_DIR
+    CHUNK_STORE_DIR = os.path.join(BASE_STORE_DIR, str(local_port))
     bootstrap_addr = None
     joined_network = False
 
-    if len(sys.argv) > 2:
-        host, port = sys.argv[2].rsplit(":", 1)
-        bootstrap_addr = (host, int(port))
+    if len(arguments) > 1:
+        host, port = arguments[1].rsplit(":", 1)
+        # FIX 6: resolve names such as "localhost" so the JOIN_ACK source
+        # address comparison (an IP tuple) matches the configured bootstrap.
+        bootstrap_addr = (socket.gethostbyname(host), int(port))
 
-    advertise_ip = "127.0.0.1"
+    # FIX 6: advertise a reachable address instead of a hard-coded loopback.
+    advertise_ip = explicit_ip or detect_advertise_ip(bootstrap_addr)
 
     server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     server.setsockopt(
@@ -2537,13 +2933,23 @@ def main():
         SOCKET_RECEIVE_BUFFER_SIZE,
     )
     server.bind(("0.0.0.0", local_port))
+    # Windows reports an ICMP "port unreachable" from an earlier sendto as an
+    # error on the next recvfrom (WSAECONNRESET). Turn that off so a crashed
+    # peer cannot disturb the receive loop.
+    if hasattr(socket, "SIO_UDP_CONNRESET"):
+        try:
+            server.ioctl(socket.SIO_UDP_CONNRESET, False)
+        except (OSError, ValueError):
+            pass
 
     peer_id = 0 if bootstrap_addr is not None else id_generation()
     if bootstrap_addr is None:
         joined_network = True
 
-    test_peer_helpers()
-
+    # FIX 14: the routing self-test mutates the global peer list, so it now
+    # runs only on request instead of on every start.
+    if run_self_test:
+        test_peer_helpers()
 
     threading.Thread(target=receive, daemon=True).start()
     threading.Thread(target=broadcast, daemon=True).start()

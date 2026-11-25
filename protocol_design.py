@@ -7,8 +7,16 @@ header_size = struct.calcsize(HEADER_FORMAT)
 CHECKSUM_OFFSET = header_size - 2 #this beacure the last two bytes are the checksum bytes
 MAX_DATAGRAM_SIZE = 1024
 CHAT_SEQUENCE_SIZE = struct.calcsize("!I")
-MAX_CHAT_TEXT_BYTES = MAX_DATAGRAM_SIZE - header_size - CHAT_SEQUENCE_SIZE
-PROTOCOL_VERSION = 1
+# FIX 5 (protocol version 2): CHAT starts with a 32-bit sender session ID
+# followed by the 32-bit chat sequence, so a receiver can tell a restarted
+# sender stream apart from retransmissions of an old one.
+CHAT_SESSION_SIZE = struct.calcsize("!I")
+CHAT_PREFIX_SIZE = CHAT_SESSION_SIZE + CHAT_SEQUENCE_SIZE
+MAX_CHAT_TEXT_BYTES = MAX_DATAGRAM_SIZE - header_size - CHAT_PREFIX_SIZE
+PROTOCOL_VERSION = 2
+MAX_PACKET_TYPE = 18
+# Packet types that carry header seq_no/ack_no; every other type uses zero.
+SEQUENCED_PACKET_TYPES = (1, 5)
 CHUNK_NAK_REASONS = {
     "NOT_STORED": 1,
     "BUSY": 2,
@@ -49,6 +57,20 @@ def check_datagram(datagram, show_output=True):
     actual_payload_length = len(datagram[header_size:])
     packet_type = decoded_fields[2]
     payload = datagram[header_size:]
+
+    # FIX 7: enforce the header rules the specification states.
+    if packet_type > MAX_PACKET_TYPE:
+        raise ValueError("Unknown packet type")
+    if decoded_fields[4] != 0:
+        raise ValueError("Flags must be zero in this protocol version")
+    if decoded_fields[5] != 0:
+        raise ValueError("Group ID must be zero in this protocol version")
+    if packet_type not in SEQUENCED_PACKET_TYPES and (
+        decoded_fields[6] != 0 or decoded_fields[7] != 0
+    ):
+        raise ValueError("Only CHAT and ACK may use header sequence fields")
+    if packet_type == 1 and decoded_fields[7] != 0:
+        raise ValueError("CHAT ack_no must be zero")
 
     if packet_type in (0, 3, 4, 6, 11, 18):
         if decoded_fields[6] != 0 or decoded_fields[7] != 0:
@@ -112,11 +134,12 @@ def check_datagram(datagram, show_output=True):
         if packet_type == 1:
             if show_output:
                 print(struct.unpack(HEADER_FORMAT, datagram[:header_size]))
-            chat_sequence, message_delivered = decode_chat_payload(payload)
+            session_id, chat_sequence, message_delivered = decode_chat_payload(payload)
             if show_output:
+                print("Chat session:", session_id)
                 print("Chat sequence:", chat_sequence)
                 print(message_delivered)
-            return chat_sequence, message_delivered
+            return session_id, chat_sequence, message_delivered
 
         elif packet_type == 11:  # NEW_PEER
             if len(payload) != 8:
@@ -348,7 +371,7 @@ def check_datagram(datagram, show_output=True):
                 raise ValueError("PEER_LIST_REQ payload must be empty")
             return None
 
-
+        raise ValueError("Unknown packet type")
 
     else:
         raise ValueError("Payload length does not match its header")
@@ -432,7 +455,13 @@ def get_file_id(file_path):
     return file_hash.digest()
 
 
-def make_chat_payload(chat_sequence, text):
+def make_chat_payload(session_id, chat_sequence, text):
+    if not isinstance(session_id, int) or isinstance(session_id, bool):
+        raise ValueError("session_id must be an integer")
+
+    if not 1 <= session_id <= 0xFFFFFFFF:
+        raise ValueError("session_id must be between 1 and 4294967295")
+
     if not isinstance(chat_sequence, int) or isinstance(chat_sequence, bool):
         raise ValueError("chat_sequence must be an integer")
 
@@ -449,27 +478,30 @@ def make_chat_payload(chat_sequence, text):
             f"Chat text exceeds the {MAX_CHAT_TEXT_BYTES}-byte limit"
         )
 
-    return struct.pack("!I", chat_sequence) + text_bytes
+    return struct.pack("!II", session_id, chat_sequence) + text_bytes
 
 
 def decode_chat_payload(payload):
-    if len(payload) < CHAT_SEQUENCE_SIZE:
-        raise ValueError("CHAT payload is missing its chat sequence number")
+    if len(payload) < CHAT_PREFIX_SIZE:
+        raise ValueError("CHAT payload is missing its session or chat sequence")
 
-    if len(payload) > CHAT_SEQUENCE_SIZE + MAX_CHAT_TEXT_BYTES:
+    if len(payload) > CHAT_PREFIX_SIZE + MAX_CHAT_TEXT_BYTES:
         raise ValueError("CHAT payload exceeds the datagram size limit")
 
-    chat_sequence = struct.unpack("!I", payload[:CHAT_SEQUENCE_SIZE])[0]
+    session_id, chat_sequence = struct.unpack("!II", payload[:CHAT_PREFIX_SIZE])
+
+    if session_id == 0:
+        raise ValueError("session_id must be nonzero")
 
     if chat_sequence == 0:
         raise ValueError("chat_sequence must start at 1")
 
     try:
-        text = payload[CHAT_SEQUENCE_SIZE:].decode("utf-8")
+        text = payload[CHAT_PREFIX_SIZE:].decode("utf-8")
     except UnicodeDecodeError as error:
         raise ValueError("CHAT text is not valid UTF-8") from error
 
-    return chat_sequence, text
+    return session_id, chat_sequence, text
 
 
 def make_payload(payload, packet_type):
@@ -485,8 +517,8 @@ def make_payload(payload, packet_type):
         return struct.pack("!HI", peer_count, view_hash)
 
     elif packet_type == 1:
-        chat_sequence, text = payload
-        return make_chat_payload(chat_sequence, text)
+        session_id, chat_sequence, text = payload
+        return make_chat_payload(session_id, chat_sequence, text)
 
     elif packet_type == 2:
         file_id, chunk_index, start_offset, length = payload
@@ -669,6 +701,12 @@ def make_datagram(
     ack_no=0,
 ):
     packet_type = get_packet_type(packet_name)
+
+    # FIX 7: the sender enforces the same header rules as check_datagram.
+    if flags != 0 or group_id != 0:
+        raise ValueError("flags and group_id must be zero in this protocol version")
+    if packet_type not in SEQUENCED_PACKET_TYPES and (seq_no != 0 or ack_no != 0):
+        raise ValueError("Only CHAT and ACK may use header sequence fields")
 
     if packet_type == 1 and not 1 <= seq_no <= 0xFFFF:
         raise ValueError("CHAT seq_no must be between 1 and 65535")
@@ -1075,7 +1113,7 @@ def main():
         packet_name="ACK",
         peer_id=1002,
         destination_p_id=1001,
-        protocol_version=1,
+        protocol_version=PROTOCOL_VERSION,
         flags=0,
         group_id=0,
         seq_no=0,
@@ -1103,7 +1141,7 @@ def main():
         packet_name="JOIN_ACK",
         peer_id=1001,
         destination_p_id=1004,
-        protocol_version=1,
+        protocol_version=PROTOCOL_VERSION,
         flags=0,
         group_id=0,
         seq_no=0,
@@ -1135,7 +1173,7 @@ def main():
         packet_name="NEW_PEER",
         peer_id=1001,
         destination_p_id=1002,
-        protocol_version=1,
+        protocol_version=PROTOCOL_VERSION,
         flags=0,
         group_id=0,
         seq_no=0,
@@ -1165,10 +1203,10 @@ def main():
         packet_name="FILE_LIST",
         peer_id=1001,
         destination_p_id=1002,
-        protocol_version=1,
+        protocol_version=PROTOCOL_VERSION,
         flags=0,
         group_id=0,
-        seq_no=4,
+        seq_no=0,
         ack_no=0,
         payload=files_to_send,
     )
@@ -1188,10 +1226,10 @@ def main():
         packet_name="REPLICATE_REQ",
         peer_id=1001,
         destination_p_id=1002,
-        protocol_version=1,
+        protocol_version=PROTOCOL_VERSION,
         flags=0,
         group_id=0,
-        seq_no=5,
+        seq_no=0,
         ack_no=0,
         payload=requested_chunk,
     )
@@ -1207,14 +1245,14 @@ def main():
 
     # Test checksum.
     print("\nTesting checksum:")
-    good = make_datagram("CHAT", 1001, 1002, 1, 0, 0, 1, (1, "hello"))
+    good = make_datagram("CHAT", 1001, 1002, PROTOCOL_VERSION, 0, 0, 1, (1, 1, "hello"))
     assert compute_checksum(good) == struct.unpack(HEADER_FORMAT, good[:header_size])[9]
     assert checksum(good) == 0  # full datagram with checksum in place sums to zero
     check_datagram(good)
 
     # Even-length and odd-length datagrams both work.
-    odd = make_datagram("CHAT", 1001, 1002, 1, 0, 0, 1, (1, "hell"))
-    even = make_datagram("CHAT", 1001, 1002, 1, 0, 0, 1, (1, "hello"))
+    odd = make_datagram("CHAT", 1001, 1002, PROTOCOL_VERSION, 0, 0, 1, (1, 1, "hell"))
+    even = make_datagram("CHAT", 1001, 1002, PROTOCOL_VERSION, 0, 0, 1, (1, 1, "hello"))
     assert len(odd) % 2 != len(even) % 2
     check_datagram(odd)
     check_datagram(even)
@@ -1241,35 +1279,35 @@ def main():
 
     # Test the CHAT payload format and 1,024-byte datagram limit.
     print("\nTesting CHAT payload format and size:")
-    sample_payload = make_chat_payload(7, "hello")
-    assert decode_chat_payload(sample_payload) == (7, "hello")
+    sample_payload = make_chat_payload(3, 7, "hello")
+    assert decode_chat_payload(sample_payload) == (3, 7, "hello")
 
     maximum_chat = make_datagram(
         packet_name="CHAT",
         peer_id=1001,
         destination_p_id=1002,
-        protocol_version=1,
+        protocol_version=PROTOCOL_VERSION,
         flags=0,
         group_id=0,
         seq_no=1,
-        payload=(1, "A" * MAX_CHAT_TEXT_BYTES),
+        payload=(1, 1, "A" * MAX_CHAT_TEXT_BYTES),
     )
     assert len(maximum_chat) == MAX_DATAGRAM_SIZE
 
-    unicode_boundary = make_chat_payload(1, "é" * 500)
-    assert len(unicode_boundary) == CHAT_SEQUENCE_SIZE + MAX_CHAT_TEXT_BYTES
+    unicode_boundary = make_chat_payload(1, 1, "é" * (MAX_CHAT_TEXT_BYTES // 2))
+    assert len(unicode_boundary) == CHAT_PREFIX_SIZE + MAX_CHAT_TEXT_BYTES
 
     try:
-        make_chat_payload(1, "A" * (MAX_CHAT_TEXT_BYTES + 1))
+        make_chat_payload(1, 1, "A" * (MAX_CHAT_TEXT_BYTES + 1))
         raise AssertionError("Oversized CHAT text was accepted")
     except ValueError:
-        print("CHAT text over 1,000 encoded bytes was rejected.")
+        print(f"CHAT text over {MAX_CHAT_TEXT_BYTES} encoded bytes was rejected.")
 
     try:
         check_datagram(maximum_chat + b"x")
         raise AssertionError("Oversized CHAT datagram was accepted")
     except ValueError as error:
-        assert "1024 bytes" in str(error)
+        assert "1,024 bytes" in str(error) or "1024 bytes" in str(error)
         print("CHAT datagram over 1,024 bytes was rejected.")
 
     print("CHAT payload and size tests passed.")
@@ -1292,10 +1330,10 @@ def main():
             packet_name="CHUNK_DATA",
             peer_id=1001,
             destination_p_id=1002,
-            protocol_version=1,
+            protocol_version=PROTOCOL_VERSION,
             flags=0,
             group_id=0,
-            seq_no=fragment_offset // 500,
+            seq_no=0,
             ack_no=0,
             payload=(
                 file_id,

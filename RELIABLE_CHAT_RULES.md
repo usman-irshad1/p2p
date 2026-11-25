@@ -1,8 +1,8 @@
-# Reliable Ordered Chat Rules (Version 1)
+# Reliable Ordered Chat Rules (Version 2)
 
 **Status:** Approved for the project implementation on 19 Nov 2026.
 
-This document specifies the version 1 rules for reliable, ordered group chat over UDP. It applies to chat delivery; it does not define file-transfer reliability.
+This document specifies the version 2 rules for reliable, ordered group chat over UDP. It applies to chat delivery; it does not define file-transfer reliability.
 
 ## 1. Recipients and membership
 
@@ -15,18 +15,18 @@ Each peer-to-peer recipient stream is independent. A slow or unresponsive recipi
 The `CHAT` payload is:
 
 ```text
-uint32 chat_sequence | UTF-8 text bytes
+uint32 session_id | uint32 chat_sequence | UTF-8 text bytes
 ```
 
 `chat_sequence` is a per-sender, per-recipient counter that begins at 1. The same group chat text may carry different `chat_sequence` values for different recipients. It orders that recipient's messages from this sender.
 
-The current receiver uses `recvfrom(1024)`. Version 1 therefore limits the complete application datagram to 1,024 bytes. With a 20-byte header and 4-byte chat sequence, UTF-8 text is limited to 1,000 bytes. The limit counts encoded bytes, not characters.
+The current receiver uses `recvfrom(1024)`. Version 2 therefore limits the complete application datagram to 1,024 bytes. With a 20-byte header, a 4-byte session ID and a 4-byte chat sequence, UTF-8 text is limited to 996 bytes. The limit counts encoded bytes, not characters.
 
 ## 3. Sequence numbers
 
-The header `seq_no` is a 16-bit counter for CHAT datagrams sent in one direction between two peers. It is separate from the 32-bit `chat_sequence` in the payload. Each counter starts at 1 for a newly established peer-to-peer session. Both counters are per recipient and do not wrap; peer removal clears their state. Other version 1 packet types use zero for both header sequence fields.
+The header `seq_no` is a 16-bit counter for CHAT datagrams sent in one direction between two peers. It is separate from the 32-bit `chat_sequence` in the payload. Both counters start at 1 for a sender's session with one recipient. They are per recipient and do not wrap. Other version 2 packet types use zero for both header sequence fields.
 
-Version 1 does not wrap either counter. Before either counter would exceed its field's maximum, the sender must leave and establish a new peer session using a new peer ID. The new session starts its counters at 1. Receivers discard the old session's pending chat, expected-sequence, and duplicate-tracking state when that peer is removed.
+Neither counter wraps. Each stream has a random nonzero `session_id`. When a sender removes a recipient, it discards its outgoing stream; a later stream to the same peer gets a new session ID and starts both counters at 1. A receiver keeps its expected counters per sender and session ID, even when it removes the sender, and resets them only when a new session ID arrives. A datagram from a session the receiver has already replaced is discarded. This prevents the two failures of version 1, where a one-sided timeout either blocked a stream permanently or ACKed new messages as duplicates without displaying them.
 
 ## 4. ACK format and meaning
 

@@ -1,6 +1,6 @@
 # P2P UDP Group Chat and File Sharing Protocol
 
-**Status:** Version 1 implementation specification. Membership, chat, and file-transfer messages use the packet layouts below. Live multi-peer interoperability and loss behavior still need verification.
+**Status:** Version 2 implementation specification. Version 2 adds a 32-bit session ID to CHAT (see FIXES.md, fix 5); every other packet layout is unchanged from version 1. A peer rejects datagrams that carry any other version. A four-peer live run (chat, two 2.5 MB files, multi-source download, a source crash during a download, and re-replication) passes in `tests/integration_test.py`; packet-loss behavior still needs a lossy-network test.
 
 ## 1. Purpose and network model
 
@@ -29,11 +29,11 @@ HEADER_FORMAT = "!HHBBHIHHHH"
 | 1 | Source peer ID | `H` | 2 bytes | ID of the sending peer. ID 0 is used only by an unassigned JOIN request. |
 | 2 | Destination peer ID | `H` | 2 bytes | ID of the intended peer. ID 0 is reserved for an unassigned JOIN; 65535 is reserved for group broadcast. |
 | 3 | Packet type | `B` | 1 byte | Identifies the message format. |
-| 4 | Protocol version | `B` | 1 byte | Version 1 is used by current examples. |
-| 5 | Flags | `H` | 2 bytes | Reserved; all bits must be zero in version 1. |
-| 6 | Group ID | `I` | 4 bytes | Reserved; must be zero in version 1, which supports one group per process. |
-| 7 | Sequence number | `H` | 2 bytes | Per-recipient CHAT packet sequence; zero for other packet types in version 1. |
-| 8 | Acknowledgment number | `H` | 2 bytes | Exact CHAT packet sequence carried by ACK; zero for other packet types in version 1. |
+| 4 | Protocol version | `B` | 1 byte | Must be 2. Datagrams with any other value are rejected. |
+| 5 | Flags | `H` | 2 bytes | Reserved; all bits must be zero. A receiver rejects nonzero flags. |
+| 6 | Group ID | `I` | 4 bytes | Reserved; must be zero (one group per process). A receiver rejects a nonzero group ID. |
+| 7 | Sequence number | `H` | 2 bytes | Per-recipient CHAT packet sequence; must be zero for every other packet type (including CHUNK_DATA). |
+| 8 | Acknowledgment number | `H` | 2 bytes | Exact CHAT packet sequence carried by ACK; must be zero for every other packet type. |
 | 9 | Payload length | `H` | 2 bytes | Number of payload bytes, excluding the 20-byte header. |
 | 10 | Checksum | `H` | 2 bytes | 16-bit one's-complement Internet checksum over the full datagram with this field zeroed during calculation. |
 
@@ -58,7 +58,7 @@ Packet type numbers currently assigned in `protocol_design.py`:
 | ID | Name | Payload layout | Current status |
 |---:|---|---|---|
 | 0 | JOIN | Empty | Live newcomer sends this to the bootstrap UDP address with source and destination IDs set to 0; it retries until JOIN_ACK arrives. |
-| 1 | CHAT | `uint32 chat_sequence` followed by UTF-8 text | Live encoder/parser, per-peer ordering, duplicate handling, and exact ACKs exist. |
+| 1 | CHAT | `uint32 session_id`, `uint32 chat_sequence`, then UTF-8 text | Live encoder/parser, per-peer ordering, duplicate handling, and exact ACKs exist. |
 | 2 | CHUNK_REQUEST | 32-byte file ID + three `uint32` values: `chunk_index`, `start_offset`, `length` | Live handler requests a byte range from a stored chunk; range requests resume partial downloads. |
 | 3 | LEAVE | Empty | Live peer sends one unacknowledged packet to each known peer; heartbeat timeout covers a lost LEAVE. |
 | 4 | HEARTBEAT | `uint16 peer_count` + `uint32 view_hash` | Sent every 2 seconds to each known peer; peers are removed after 6 seconds without one. |
@@ -87,7 +87,7 @@ All multi-byte integers use network byte order. Binary fields are concatenated i
 
 Payload: empty. The sequence being acknowledged is carried in header field `ack_no`.
 
-Version 1 uses exact ACKs for CHAT: `ack_no` equals the `seq_no` of the particular CHAT datagram received. ACK packets have `seq_no = 0`, an empty payload, and are not themselves acknowledged. A receiver repeats the exact ACK when it receives a valid duplicate CHAT, allowing recovery if the original ACK was lost.
+Version 2 uses exact ACKs for CHAT: `ack_no` equals the `seq_no` of the particular CHAT datagram received. ACK packets have `seq_no = 0`, an empty payload, and are not themselves acknowledged. A receiver repeats the exact ACK when it receives a valid duplicate CHAT, allowing recovery if the original ACK was lost.
 
 ### JOIN_ACK (type 6)
 
@@ -127,11 +127,12 @@ The payload is exactly 6 bytes. The view hash is CRC-32 over the network-byte-or
 Payload:
 
 ```text
+uint32 session_id
 uint32 chat_sequence
 remaining bytes: UTF-8 chat text
 ```
 
-The header's 16-bit `seq_no` is the reliable packet sequence for one sender-recipient CHAT stream and is matched exactly by the ACK's `ack_no`. The 32-bit `chat_sequence` in the payload orders that sender's chat messages for the same recipient. Both counters begin at 1 and do not wrap; peer removal clears their state. Membership and file packets set both header sequence fields to zero.
+The header's 16-bit `seq_no` is the reliable packet sequence for one sender-recipient CHAT stream and is matched exactly by the ACK's `ack_no`. The 32-bit `chat_sequence` in the payload orders that sender's chat messages for the same recipient. `session_id` is a nonzero random value the sender chooses when it starts a stream to a recipient; when the sender removes that recipient, it discards the stream and uses a new session ID next time. Within a session, both counters begin at 1 and do not wrap. A receiver keeps its expected counters per sender and session: a new session ID resets them to 1, and datagrams from a session it has already replaced are discarded. With the 8-byte prefix, chat text is limited to 996 UTF-8 bytes. Membership and file packets set both header sequence fields to zero.
 
 ### CHUNK_REQUEST and CHUNK_HAVE (types 2 and 9)
 
@@ -162,7 +163,7 @@ remaining bytes: fragment_data
 
 The metadata is 44 bytes. `fragment_offset` is the byte offset within the chunk. `total_chunk_size` is the size of the whole chunk and is repeated in every fragment. `fragment_data` contains only the bytes carried by this fragment; there is no padding.
 
-The current live implementation sends fragments of at most 960 bytes, in windows of up to 32 fragments. It paces transmission with a 1 ms pause after each eight-fragment burst and sets the UDP socket receive buffer request to 4 MiB. The receiver validates fragment ranges and the assembled chunk hash before storage. Chunks are kept under `peer_chunks/<file_id>/<chunk_index>.chunk`.
+The current live implementation sends fragments of at most 960 bytes, in windows of up to 32 fragments. It paces transmission with a 1 ms pause after each eight-fragment burst and sets the UDP socket receive buffer request to 4 MiB. The receiver validates fragment ranges and the assembled chunk hash before storage. Chunks are kept under `peer_chunks/<port>/<file_id>/<chunk_index>.chunk`, one store per peer process. A user download is staged in a private folder, is never announced with CHUNK_HAVE, and is deleted after the file is assembled, so a downloader does not become an owner of every chunk.
 
 ### CHUNK_ACK (type 13) - selective chunk acknowledgement
 
@@ -277,7 +278,7 @@ Implemented reliable-chat behavior:
 
 The per-peer CHAT window is eight datagrams. Per-peer SRTT and RTTVAR are updated from ACKs for packets that were not retransmitted; RTO is clamped to 0.2–3 seconds and doubles on retransmission up to 3 seconds. CHAT packets are retried until acknowledged or that peer is removed. Packet and chat sequence counters start at 1 and do not wrap; when a counter reaches its field limit, the sender must establish a new peer session. ACK packets are not acknowledged.
 
-For chunk transfer, CHUNK_ACK is a separate selective acknowledgement keyed by `(file_id, chunk_index)`. Its cumulative offset and 32-bit fragment bitmap report received byte ranges; it does not use the header's exact `ack_no`. A sender keeps at most 32 fragments outstanding for a chunk and resends only missing fragments using the current peer RTO, for up to five rounds per window. If the requested owner lacks the bytes, it sends CHUNK_NAK with NOT_STORED and the requester tries its next known owner. Live loss and failover behavior still needs multi-peer verification.
+For chunk transfer, CHUNK_ACK is a separate selective acknowledgement keyed by `(file_id, chunk_index)`. Its cumulative offset and 32-bit fragment bitmap report received byte ranges; it does not use the header's exact `ack_no`. A sender keeps at most 32 fragments outstanding for a chunk and resends only missing fragments using the current peer RTO, for up to five rounds per window. If the requested owner lacks the bytes, it sends CHUNK_NAK with NOT_STORED and the requester tries its next known owner. Source-crash failover was exercised by the four-peer integration test; packet-loss behavior still needs a lossy-network test.
 
 ## 6. Message flows
 
@@ -306,15 +307,15 @@ Current status: binary CHAT and ACK are used by the live P2P program with per-pe
 
 ### File transfer
 
-Current basic flow: after at least three peers are known, `/index <path>` hashes a file, divides it into 256 KiB chunks, uses bounded HRW hashing to select two owners per chunk, advertises metadata/ownership, and sends REPLICATE_REQ to remote owners. A destination requests its chunk, reassembles CHUNK_DATA, stores it, and announces CHUNK_HAVE. The source removes its temporary chunk copy after both assigned peers report ownership. A requester uses `/download <file_id_hex> [output_path]`; a sliding pool keeps up to four chunk downloads active, prefers chunks with fewer owners, and plans at most two concurrent chunk downloads per source. It sends ranged requests, resumes from the first missing byte, fails over after three per-peer RTOs without progress, rebuilds the file, and verifies its SHA-256 against the file ID.
+Current basic flow: after at least three peers are known, `/index <path>` hashes a file, divides it into 256 KiB chunks, uses bounded HRW hashing to select two owners per chunk, advertises metadata/ownership, and sends REPLICATE_REQ to remote owners. The indexer keeps each REPLICATE_REQ and resends it every 2 seconds, up to 10 times, until that owner's CHUNK_HAVE arrives or the owner is removed. A peer declines a replica that would give it every chunk of a file. A destination requests its chunk, reassembles CHUNK_DATA, stores it, and announces CHUNK_HAVE. The source removes its temporary chunk copy after both assigned peers report ownership. A requester uses `/download <file_id_hex> [output_path]`; a sliding pool keeps up to four chunk downloads active, prefers chunks with fewer owners, and plans at most two concurrent chunk downloads per source. It sends ranged requests, resumes from the first missing byte, fails over after three per-peer RTOs without progress (each new owner gets its own three-RTO budget), retries a failed chunk up to three times with a fresh owner list, rebuilds the file, and verifies its SHA-256 against the file ID.
 
-Peers exchange one CHUNK_HASH digest per cataloged chunk. For each requested chunk, the source sends CHUNK_DATA in windows of up to 32 fragments. The receiver sends CHUNK_ACK with cumulative progress and a bitmap of later received fragments. After each peer-RTO wait, the source retransmits only unacknowledged fragments, for at most five send rounds per window; if a window remains incomplete, the requester can resume with another owner after three RTOs without progress. After reassembly, the receiver checks the chunk digest before storing it. A mismatch produces CHUNK_NAK/HASH_MISMATCH; an unavailable chunk produces CHUNK_NAK/NOT_STORED. In either case, the requester tries its next advertised owner. These paths are implemented but still need packet-loss and failover testing.
+Peers exchange one CHUNK_HASH digest per cataloged chunk. For each requested chunk, the source sends CHUNK_DATA in windows of up to 32 fragments. The receiver sends CHUNK_ACK with cumulative progress and a bitmap of later received fragments. After waiting one full peer RTO (or until the whole window is acknowledged), the source retransmits only unacknowledged fragments, for at most five send rounds per window; if a window remains incomplete, the requester can resume with another owner after three RTOs without progress. After reassembly, the receiver checks the chunk digest before storing it. A mismatch produces CHUNK_NAK/HASH_MISMATCH; an unavailable chunk produces CHUNK_NAK/NOT_STORED. In either case, the requester tries its next advertised owner. Source-crash failover was exercised; packet-loss and intentional hash-mismatch behavior still need targeted tests.
 
 After a graceful LEAVE or heartbeat timeout, each peer removes the departed owner from its catalog. If a chunk is under-replicated and a surviving owner has the local chunk bytes, the lowest-ID surviving owner sends `REPLICATE_REQ` to an unassigned active peer. It retries the request periodically until a `CHUNK_HAVE` announcement restores the two-owner count. If no surviving peer has the chunk bytes, this mechanism cannot recover it.
 
 When a peer joins, it uses the current peer IDs and bounded HRW placement algorithm to find chunks assigned to it. Existing owners send `FILE_LIST`, `CHUNK_HASH`, and `CHUNK_HAVE`; the joining peer waits for each expected digest, requests its missing assigned chunks with ranged `CHUNK_REQUEST`, verifies and stores the data, and announces ownership with `CHUNK_HAVE`.
 
-Limitations: initial placement runs when `/index` is issued and needs three known peers and at least two chunks. Join rebalancing adds the joining peer's assigned copies but retains older replicas, so extras can remain. Automatic repair and join rebalancing are implemented but still need live multi-peer verification. CHUNK_ACK/CHUNK_NAK, CHUNK_HASH/CHUNK_HASH_ACK, FILE_LIST/FILE_LIST_ACK, and CHUNK_HAVE/CHUNK_HAVE_ACK handling are connected, but packet-loss recovery, hash mismatch handling, and failover still need live verification; BUSY NAK and safe removal of surplus replicas are not implemented.
+Limitations: initial placement runs when `/index` is issued and needs three known peers and at least two chunks. Join rebalancing adds the joining peer's assigned copies but retains older replicas, so extras can remain. Four-peer placement, multi-source download, source-crash failover, and re-replication passed the supplied localhost integration test. Packet-loss simulation and live hash-mismatch fallback still need targeted tests; BUSY NAK and safe removal of surplus replicas are not implemented.
 
 ## 7. Current implementation inventory
 
@@ -327,26 +328,27 @@ Limitations: initial placement runs when `/index` is issued and needs three know
 - In-memory FILE_LIST/CHUNK_HAVE catalog exchange, REPLICATE_REQ placement, and on-disk chunk store.
 - Basic live ranged CHUNK_REQUEST/CHUNK_DATA transfer, an adaptive sliding download pool of up to four chunks, request retries/failover, and whole-file SHA-256 verification.
 - Bounded HRW placement, a requested 4 MiB socket receive buffer, paced CHUNK_DATA bursts, and CRC-32 membership-view repair.
-- Binary UDP membership with JOIN retries, ID assignment and peer snapshots in JOIN_ACK, NEW_PEER announcements, HEARTBEAT/LEAVE, heartbeat-view repair, and timeout removal. Live behavior still needs multi-peer verification.
+- Binary UDP membership with JOIN retries, ID assignment and peer snapshots in JOIN_ACK, NEW_PEER announcements, HEARTBEAT/LEAVE, heartbeat-view repair, and timeout removal. Four-peer localhost membership and crash timeout were observed by the supplied integration test.
 - Local screenshots show three-peer discovery, heartbeat/timeout behavior, and graceful leave behavior.
 
 ### Remaining implementation and verification
 
-- Live membership packets now use the binary packet layouts documented above. Multi-peer loss, simultaneous join, and peer-list overflow cases still need verification; a JOIN_ACK peer list is currently limited to one datagram.
-- Flags and multi-group semantics are not defined for version 1; unused flag bits must stay zero.
-- The current socket advertises `127.0.0.1`, so live runs on separate machines need a real reachable address and network testing.
-- Packet-loss, peer-failure, integrity rejection, multi-source download, and four-peer behavior still require live verification.
+- Live membership packets use the binary packet layouts documented above. Packet loss, simultaneous join, and peer-list overflow cases still need verification; a JOIN_ACK peer list is currently limited to one datagram.
+- Flags and multi-group semantics are not defined for version 2; unused flag bits must stay zero.
+- A peer advertises the local address it uses to reach its bootstrap (or the `--ip` value), and a receiver of JOIN_ACK uses the responder's real UDP source address. Runs across separate machines still need network testing.
+- Packet-loss simulation and intentional integrity-failure behavior still require targeted live verification. Four-peer behavior, multi-source download, peer failure, and repair passed the supplied localhost integration test.
 
 ## 8. Remaining protocol and project checklist
 
 - [x] Document header field semantics, checksum behavior, broadcast ID 65535, unassigned ID 0, exact ACKs, sequence exhaustion, and current retry rules.
-- [x] Integrate binary JOIN, JOIN_ACK, NEW_PEER, LEAVE, HEARTBEAT, and PEER_LIST_REQ handlers; live multi-peer and packet-loss verification remains pending.
+- [x] Integrate binary JOIN, JOIN_ACK, NEW_PEER, LEAVE, HEARTBEAT, and PEER_LIST_REQ handlers; four-peer localhost membership was exercised, with packet-loss verification pending.
 - [x] Document current JOIN, CHAT, file-transfer, LEAVE, and HEARTBEAT flows.
 - [x] Add encoders and parsers for the packet types currently used by chat and file transfer, including ranged CHUNK_REQUEST and PEER_LIST_REQ.
 - [x] Validate packet length and checksum before the live handlers accept a packet.
 - [ ] Add a round-trip test vector for every packet type and malformed-packet checks.
-- [ ] Run the file placement/download flow with four peers, including a stopped chunk source, and record results.
+- [x] Run file placement/download with four peers, multiple sources, and a stopped chunk source; record the integration output and repeat from `python integration_test.py`.
+- [ ] Simulate packet loss and intentional chunk corruption; record results.
 
 ## 9. Versioning rule
 
-The current examples use protocol version 1. If peers change the meaning of a field or payload format incompatibly, increment the protocol version or introduce a clearly defined version-negotiation rule. A peer should reject or safely ignore unsupported versions rather than guessing their format.
+The current protocol version is 2 (version 1 had no CHAT session ID). If peers change the meaning of a field or payload format incompatibly, increment the protocol version or introduce a clearly defined version-negotiation rule. A peer should reject or safely ignore unsupported versions rather than guessing their format.
