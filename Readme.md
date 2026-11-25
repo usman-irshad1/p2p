@@ -44,6 +44,7 @@ These items are implemented in the current code. See the checklist below for wha
 - [x] CHUNK_REQUEST carries a start offset and length so a download can resume at the first missing byte; a source change is attempted after three adaptive RTOs without progress.
 - [x] CHUNK_DATA transmission pauses briefly after each eight-fragment burst; the UDP socket requests a 4 MiB receive buffer (the operating system may clamp this value).
 - [x] Live CHUNK_ACK/CHUNK_NAK handling: receivers report cumulative progress and selective fragment receipt; each 32-fragment window gets up to five send rounds, and a missing chunk triggers NOT_STORED.
+- [x] Chunk serving accepts up to four simultaneous outgoing transfers and replies with CHUNK_NAK/BUSY when all slots are occupied, allowing the downloader to try another owner.
 - [x] On LEAVE or heartbeat timeout, the lowest-ID surviving owner asks an unassigned peer to copy an under-replicated chunk; repair requests retry until a replacement owner is announced.
 - [x] When a peer joins, it computes its assigned share and fetches missing chunks from known owners; old replicas are retained, so this is additive rebalancing.
 - [x] Heartbeats include a CRC-32 membership-view hash; two consecutive mismatches trigger a binary PEER_LIST_REQ and JOIN_ACK snapshot exchange.
@@ -58,6 +59,7 @@ These items are implemented in the current code. See the checklist below for wha
 
 - [ ] Simulate network packet loss and verify FILE_LIST, CHUNK_HASH, CHUNK_HAVE retries and selective fragment retransmission; save screenshots.
 - [ ] Corrupt a stored chunk/digest and verify hash rejection and fallback to a replica; save screenshots.
+- [ ] Saturate a source's four transfer slots and verify BUSY response plus alternate-owner failover; save screenshots.
 - [x] Run the supplied four-peer localhost integration check: membership, chat, two 2.5 MB files, replica count, and no complete-file owner.
 - [ ] Index at least two 2 MB-or-larger files from each participant (the included test indexes two files total).
 - [x] Integration run downloaded a file from multiple source peers and checked its SHA-256.
@@ -96,9 +98,9 @@ From the project directory, run:
 python integration_test.py
 ```
 
-The checker runs the unit suite, then starts four localhost peers. The integration test indexes two generated 2.5 MB files, checks two owners per chunk with no full-file owner, checks chat, downloads from multiple peers, stops a source during a second download, and checks timeout removal and replica repair. The unit suite also covers protocol validation, placement, and chat-session behavior.
+The checker runs the unit suite, starts four localhost peers, and indexes two 2.5 MB files from each. It then adds a fifth peer after the catalog is populated, checks that it receives its assigned chunks, and indexes two files from it as well. The run simulates one lost CHUNK_DATA fragment, a BUSY reply, a corrupted replica, and a source crash during download. It verifies overlapping chunk downloads, multi-source reconstruction, timeout removal, and replica repair.
 
-Temporary test stores and files are removed when the checker exits. It chooses four free consecutive UDP ports unless `P2P_TEST_PORT` is set. The test verifies localhost behavior; it does not simulate arbitrary packet loss, test multiple participant files per peer, or provide performance graphs.
+Temporary test stores and files are removed when the checker exits. It chooses five free consecutive UDP ports unless `P2P_TEST_PORT` is set. The run prints localhost timing measurements and saves them to `output/integration_metrics.csv`. It does not verify real LAN/firewall behavior or simulate packet loss for every packet type; those checks still need a multi-machine run and broader loss tests.
 
 In a peer terminal, share a file and inspect the catalog:
 

@@ -1,0 +1,6 @@
+measurement,value,unit,environment
+chat broadcast delivery,0.101343,seconds,localhost
+2.5 MB multi-source download,0.802552,seconds,localhost
+download throughput,2.970754,MiB/s,localhost
+corrupt-replica fallback,1.728901,seconds,localhost
+source-crash download recovery,12.531918,seconds,localhost

@@ -6,6 +6,7 @@ Run from the project folder:  python -m unittest discover -s tests -v
 import os
 import struct
 import sys
+import threading
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -232,6 +233,29 @@ class FailoverTests(unittest.TestCase):
         # Before FIX 1 only owner A was ever asked.
         self.assertIn(self.owner_a[1], asked)
         self.assertIn(self.owner_b[1], asked)
+
+    def test_busy_chunk_nak_keeps_receive_state(self):
+        key = (self.file_id, 0)
+        state = {
+            "owner_id": self.owner_a[0],
+            "owner_addr": self.owner_a[1],
+            "error": None,
+            "event": threading.Event(),
+        }
+        p2p_file.pending_chunk_downloads[key] = state
+        datagram = build(
+            "CHUNK_NAK",
+            (self.file_id, 0, pd.CHUNK_NAK_REASONS["BUSY"]),
+            source=self.owner_a[0],
+            dest=p2p_file.peer_id,
+        )
+        try:
+            handled = p2p_file.handle_chunk_transfer(datagram, self.owner_a[1])
+            self.assertTrue(handled)
+            self.assertIsNone(state["error"])
+            self.assertFalse(state["event"].is_set())
+        finally:
+            p2p_file.pending_chunk_downloads.pop(key, None)
 
 
 if __name__ == "__main__":

@@ -34,6 +34,7 @@ rtt_lock = threading.Lock()
 outgoing_chat_queues = {}
 pending_chats = {}
 file_catalog_state = file_catalog_helpers.create_catalog()
+file_catalog_seen_at = {}
 pending_chunk_have = set()
 pending_chunk_hashes = {}
 pending_chunk_hash_acks = {}
@@ -67,6 +68,9 @@ received_chat_pairs_by_peer = {}
 outgoing_session_by_peer = {}
 receive_session_by_peer = {}
 retired_sessions_by_peer = {}
+test_preferred_owner_id = None
+test_chunk_data_drop_used = False
+test_busy_reject_used = False
 
 HEARTBEAT_INTERVAL = 2
 PEER_TIMEOUT = 6
@@ -91,9 +95,17 @@ CHUNK_FRAGMENT_DATA_SIZE = (
     protocol_design.MAX_DATAGRAM_SIZE - protocol_design.header_size - 44
 )
 CHUNK_REQUEST_TIMEOUT = 3 * INITIAL_RTO
-CHUNK_FRAGMENT_RETRIES = 5
+REPLICATION_STARTUP_GRACE = (
+    INITIAL_REPLICATION_RETRY_INTERVAL * (INITIAL_REPLICATION_RETRIES + 1)
+    + CHUNK_REQUEST_TIMEOUT
+)
+CHUNK_FRAGMENT_RETRIES = 8
 CHUNK_SEND_WINDOW = 32
-CHUNK_SEND_BURST_SIZE = 8
+CHUNK_SEND_BURST_SIZE = 4
+CHUNK_SEND_BURST_DELAY = 0.005
+CHUNK_MIN_RTO = 0.5
+MAX_ACTIVE_CHUNK_SENDS = 1
+active_chunk_send_slots = threading.BoundedSemaphore(MAX_ACTIVE_CHUNK_SENDS)
 SOCKET_RECEIVE_BUFFER_SIZE = 4 * 1024 * 1024
 CHUNK_HASH_ACK_TIMEOUT = 1
 CHUNK_HASH_RETRIES = 5
@@ -600,7 +612,7 @@ def retry_initial_replications():
     return len(due)
 
 
-def repair_under_replicated_chunks():
+def repair_under_replicated_chunks(force=False):
     """Ask a surviving chunk owner to create a replacement replica."""
     known_peer_ids = {known_id for known_id, _ in peer_snapshot()}
     known_peer_ids.add(peer_id)
@@ -627,6 +639,12 @@ def repair_under_replicated_chunks():
     requests_sent = 0
 
     for file_id, chunk_index, owner_ids in under_replicated:
+        if (
+            not force
+            and now - file_catalog_seen_at.get(file_id, now)
+            < REPLICATION_STARTUP_GRACE
+        ):
+            continue
         owners = set(owner_ids)
 
         # Every peer sees the departure; the lowest surviving owner coordinates
@@ -787,7 +805,12 @@ def rebalance_chunks_for_local_peer():
 
             task_key = (file_id, chunk_index, peer_id)
             with chunk_download_lock:
-                if task_key in active_replication_tasks:
+                if any(
+                    active_file_id == file_id
+                    and active_chunk_index == chunk_index
+                    for active_file_id, active_chunk_index, _
+                    in active_replication_tasks
+                ):
                     continue
                 active_replication_tasks.add(task_key)
 
@@ -815,6 +838,7 @@ def register_file_metadata(file_path):
             file_path,
             DEFAULT_CHUNK_SIZE,
         )
+        file_catalog_seen_at.setdefault(file_id, time.monotonic())
         metadata = file_catalog_state[file_id].copy()
 
     chunk_indices = chunk_store.split_and_store_file(
@@ -1136,12 +1160,30 @@ def send_chunk_data(
                         with chunk_send_lock:
                             if fragment_offset in send_state["first_sent"]:
                                 send_state["retransmitted"].add(fragment_offset)
+                                if os.environ.get("P2P_TEST_TRACE") == "1":
+                                    print(
+                                        f"P2P_TEST_CHUNK_RETRANSMIT:{destination_id}:"
+                                        f"{file_id.hex()}:{chunk_index}:{fragment_offset}",
+                                        flush=True,
+                                    )
                             else:
                                 send_state["first_sent"][fragment_offset] = time.monotonic()
+                        global test_chunk_data_drop_used
+                        if (
+                            os.environ.get("P2P_TEST_DROP_FIRST_CHUNK_DATA") == "1"
+                            and not test_chunk_data_drop_used
+                        ):
+                            test_chunk_data_drop_used = True
+                            print(
+                                f"P2P_TEST_DROPPED_CHUNK_DATA:{destination_id}:"
+                                f"{file_id.hex()}:{chunk_index}:{fragment_offset}",
+                                flush=True,
+                            )
+                            continue
                         server.sendto(datagram, destination_addr)
                         sent_in_burst += 1
                         if sent_in_burst >= CHUNK_SEND_BURST_SIZE:
-                            time.sleep(0.001)
+                            time.sleep(CHUNK_SEND_BURST_DELAY)
                             sent_in_burst = 0
 
                 # FIX 4: wait until the whole window is acknowledged or one
@@ -1149,7 +1191,10 @@ def send_chunk_data(
                 # on the first CHUNK_ACK, so the next "round" resent every
                 # fragment whose ACK was still in flight and burned all five
                 # rounds in a few milliseconds.
-                deadline = time.monotonic() + get_peer_rto(destination_id)
+                deadline = time.monotonic() + max(
+                    CHUNK_MIN_RTO,
+                    get_peer_rto(destination_id),
+                )
                 while True:
                     with chunk_send_lock:
                         if send_state["error"] is not None:
@@ -1172,6 +1217,34 @@ def send_chunk_data(
         with chunk_send_lock:
             if pending_chunk_sends.get(transfer_key) is send_state:
                 pending_chunk_sends.pop(transfer_key, None)
+        if os.environ.get("P2P_TEST_TRACE") == "1":
+            print(
+                f"P2P_TEST_SEND_RESULT:{destination_id}:{file_id.hex()}:"
+                f"{chunk_index}:{len(send_state['acked'])}/{len(fragments)}",
+                flush=True,
+            )
+
+
+def send_chunk_data_with_slot(
+    destination_id,
+    destination_addr,
+    file_id,
+    chunk_index,
+    start_offset,
+    length,
+):
+    """Run one reserved upload slot and release it on every exit path."""
+    try:
+        send_chunk_data(
+            destination_id,
+            destination_addr,
+            file_id,
+            chunk_index,
+            start_offset,
+            length,
+        )
+    finally:
+        active_chunk_send_slots.release()
 
 
 def contiguous_chunk_offset(fragments):
@@ -1295,6 +1368,11 @@ def request_chunk(
                         if source_reservation is not None:
                             source_reservation["owner_id"] = owner_id
             timeout = get_peer_rto(owner_id)
+            progress_timeout = max(
+                CHUNK_REQUEST_TIMEOUT,
+                CHUNK_FRAGMENT_RETRIES * max(CHUNK_MIN_RTO, timeout)
+                + CHUNK_REQUEST_TIMEOUT,
+            )
             with chunk_download_lock:
                 download_state["owner_id"] = owner_id
                 download_state["owner_addr"] = owner_addr
@@ -1331,7 +1409,7 @@ def request_chunk(
                             download_state["last_progress"] = time.monotonic()
                     break
 
-                if time.monotonic() - last_progress >= 3 * timeout:
+                if time.monotonic() - last_progress >= progress_timeout:
                     break
 
                 request_datagram = protocol_design.make_datagram(
@@ -1446,7 +1524,12 @@ def start_replication_request(file_id, chunk_index, owner_id, owner_addr):
 
     task_key = (file_id, chunk_index, owner_id)
     with chunk_download_lock:
-        if task_key in active_replication_tasks:
+        if any(
+            active_file_id == file_id
+            and active_chunk_index == chunk_index
+            for active_file_id, active_chunk_index, _
+            in active_replication_tasks
+        ):
             return
         active_replication_tasks.add(task_key)
 
@@ -1490,8 +1573,16 @@ def download_one_chunk(
     staging_dir,
 ):
     """Worker used by download_file to fetch one chunk independently."""
+    worker_started = time.monotonic()
+    trace_worker = os.environ.get("P2P_TEST_TRACE") == "1"
+    if trace_worker:
+        print(
+            f"P2P_TEST_CHUNK_WORKER_START:{file_id.hex()}:{chunk_index}:"
+            f"{worker_started:.9f}",
+            flush=True,
+        )
     try:
-        return request_chunk(
+        source_id = request_chunk(
             file_id,
             chunk_index,
             owner_order=owner_order,
@@ -1501,9 +1592,22 @@ def download_one_chunk(
             store_dir=staging_dir,
             announce=False,
         )
+        if os.environ.get("P2P_TEST_TRACE") == "1":
+            print(
+                f"P2P_TEST_CHUNK_SOURCE:{source_id}:{chunk_index}",
+                flush=True,
+            )
+        return source_id
     except Exception as error:
         errors[chunk_index] = str(error)
         return None
+    finally:
+        if trace_worker:
+            print(
+                f"P2P_TEST_CHUNK_WORKER_END:{file_id.hex()}:{chunk_index}:"
+                f"{time.monotonic():.9f}",
+                flush=True,
+            )
 
 
 def current_chunk_owners(file_id, chunk_count):
@@ -1594,6 +1698,7 @@ def download_file(file_id, destination_path):
                             for owner_id in sorted(
                                 owners_by_chunk[chunk_index],
                                 key=lambda owner_id: (
+                                    owner_id != test_preferred_owner_id,
                                     source_loads.get(owner_id, 0),
                                     random.random(),
                                 ),
@@ -1813,11 +1918,18 @@ def chat_sender_once():
 
 def chat_input():
     """Read chat lines and the small file-catalog commands from the terminal."""
+    global test_preferred_owner_id
     while True:
         try:
             text = input()
             if text == "/files":
                 show_file_catalog()
+            elif text.startswith("/test-prefer-owner ") and os.environ.get("P2P_TEST_TRACE") == "1":
+                test_preferred_owner_id = int(text.split(maxsplit=1)[1])
+                print(
+                    f"P2P_TEST_PREFERRED_OWNER_SET:{test_preferred_owner_id}",
+                    flush=True,
+                )
             elif text.startswith("/index "):
                 file_path = text[len("/index "):].strip()
                 if len(file_path) >= 2 and file_path[0] == file_path[-1] == '"':
@@ -2023,7 +2135,7 @@ def heartbeat_once():
         last_seen.pop(expired_id, None)
         print(f"Peer {expired_id} timed out and was removed")
 
-    repair_under_replicated_chunks()
+    repair_under_replicated_chunks(force=bool(expired_ids))
     retry_initial_replications()
 
 
@@ -2112,6 +2224,8 @@ def handle_membership_packet(message, addr):
                 show_output=False,
             )
             peer_id = destination_id
+            if os.environ.get("P2P_TEST_TRACE") == "1":
+                print(f"P2P_TEST_ASSIGNED_ID:{peer_id}", flush=True)
             added_peers = []
             for known_id, known_ip, known_port in peer_records:
                 # FIX 6: the responder's own record may advertise 127.0.0.1;
@@ -2221,7 +2335,7 @@ def handle_membership_packet(message, addr):
         if packet_type == leave_type:
             protocol_design.check_datagram(message, show_output=False)
             if remove_peer(sender_id, addr):
-                repair_under_replicated_chunks()
+                repair_under_replicated_chunks(force=True)
             return True
 
         if packet_type == join_type:
@@ -2412,6 +2526,9 @@ def handle_protocol_catalog(message, addr):
             ready_replications = []
             with file_catalog_lock:
                 file_catalog_helpers.merge_file_list(file_catalog_state, file_records)
+                observed_at = time.monotonic()
+                for file_id, _, _, _ in file_records:
+                    file_catalog_seen_at.setdefault(file_id, observed_at)
                 for pending_key, pending_hash in tuple(pending_chunk_hashes.items()):
                     pending_file_id, pending_index = pending_key
                     if pending_file_id in file_catalog_state:
@@ -2637,6 +2754,11 @@ def handle_chunk_transfer(message, addr):
                 message,
                 show_output=False,
             )
+            if reason == protocol_design.CHUNK_NAK_REASONS["BUSY"]:
+                # BUSY is transient: an upload may already be sending this
+                # chunk. Keep the current receive state so its fragments can
+                # arrive; a later CHUNK_REQUEST can retry if needed.
+                return True
             key = (file_id, chunk_index)
             with chunk_download_lock:
                 state = pending_chunk_downloads.get(key)
@@ -2682,11 +2804,54 @@ def handle_chunk_transfer(message, addr):
                         protocol_design.CHUNK_NAK_REASONS["NOT_STORED"],
                     )
                     return True
-                threading.Thread(
-                    target=send_chunk_data,
-                    args=(sender_id, addr, file_id, chunk_index, start_offset, length),
-                    daemon=True,
-                ).start()
+                global test_busy_reject_used
+                if (
+                    os.environ.get("P2P_TEST_BUSY_FIRST_CHUNK_REQUEST") == "1"
+                    and not test_busy_reject_used
+                ):
+                    test_busy_reject_used = True
+                    send_chunk_nak(
+                        sender_id,
+                        addr,
+                        file_id,
+                        chunk_index,
+                        protocol_design.CHUNK_NAK_REASONS["BUSY"],
+                    )
+                    print(
+                        f"P2P_TEST_FORCED_BUSY:{sender_id}:{file_id.hex()}:{chunk_index}",
+                        flush=True,
+                    )
+                    return True
+                if not active_chunk_send_slots.acquire(blocking=False):
+                    send_chunk_nak(
+                        sender_id,
+                        addr,
+                        file_id,
+                        chunk_index,
+                        protocol_design.CHUNK_NAK_REASONS["BUSY"],
+                    )
+                    return True
+                if os.environ.get("P2P_TEST_TRACE") == "1":
+                    print(
+                        f"P2P_TEST_SERVE_REQUEST:{sender_id}:"
+                        f"{file_id.hex()}:{chunk_index}",
+                        flush=True,
+                    )
+                try:
+                    threading.Thread(
+                        target=send_chunk_data_with_slot,
+                        args=(sender_id, addr, file_id, chunk_index, start_offset, length),
+                        daemon=True,
+                    ).start()
+                except (OSError, RuntimeError):
+                    active_chunk_send_slots.release()
+                    send_chunk_nak(
+                        sender_id,
+                        addr,
+                        file_id,
+                        chunk_index,
+                        protocol_design.CHUNK_NAK_REASONS["BUSY"],
+                    )
             else:
                 send_chunk_nak(
                     sender_id,
@@ -2763,6 +2928,12 @@ def handle_chunk_transfer(message, addr):
                 if hashlib.sha256(rebuilt_chunk).digest() != state["expected_hash"]:
                     state["error"] = "Received chunk SHA-256 did not match catalog"
                     state["error_reason"] = protocol_design.CHUNK_NAK_REASONS["HASH_MISMATCH"]
+                    if os.environ.get("P2P_TEST_TRACE") == "1":
+                        print(
+                            f"P2P_TEST_HASH_MISMATCH:{file_id.hex()}:"
+                            f"{chunk_index}:{sender_id}",
+                            flush=True,
+                        )
                     send_chunk_nak(
                         sender_id,
                         addr,
@@ -2779,6 +2950,12 @@ def handle_chunk_transfer(message, addr):
                     chunk_index,
                     rebuilt_chunk,
                 )
+                if os.environ.get("P2P_TEST_TRACE") == "1":
+                    print(
+                        f"P2P_TEST_CHUNK_RECEIVED:{sender_id}:"
+                        f"{file_id.hex()}:{chunk_index}",
+                        flush=True,
+                    )
                 send_chunk_ack(
                     sender_id,
                     addr,
@@ -2945,6 +3122,8 @@ def main():
     peer_id = 0 if bootstrap_addr is not None else id_generation()
     if bootstrap_addr is None:
         joined_network = True
+    if os.environ.get("P2P_TEST_TRACE") == "1" and bootstrap_addr is None:
+        print(f"P2P_TEST_ASSIGNED_ID:{peer_id}", flush=True)
 
     # FIX 14: the routing self-test mutates the global peer list, so it now
     # runs only on request instead of on every start.

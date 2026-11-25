@@ -15,7 +15,7 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parent
 
 
-def find_free_port_block(count=4):
+def find_free_port_block(count=5):
     """Find consecutive localhost UDP ports for the integration peers."""
     for _ in range(200):
         first_port = random.randrange(40000, 60000 - count)
@@ -31,7 +31,7 @@ def find_free_port_block(count=4):
         finally:
             for peer_socket in sockets:
                 peer_socket.close()
-    raise RuntimeError("Could not find four free consecutive UDP ports.")
+    raise RuntimeError("Could not find five free consecutive UDP ports.")
 
 
 def run_check(command, title, environment):
@@ -54,7 +54,7 @@ def main():
 
     return run_check(
         [sys.executable, "-u", "tests/integration_test.py"],
-        "Four-peer UDP integration check",
+        "Multi-peer UDP integration check",
         environment,
     )
 

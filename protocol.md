@@ -69,7 +69,7 @@ Packet type numbers currently assigned in `protocol_design.py`:
 | 9 | CHUNK_HAVE | 32-byte file ID + `uint32 chunk_index` | Encoder/parser and live ownership update exist. |
 | 10 | REPLICATE_REQ | 32-byte file ID + `uint32 chunk_index` | Encoder/parser exist; receiver asks the sender for its assigned chunk copy. |
 | 11 | NEW_PEER | One 8-byte peer record | Bootstrap announces a new member to each existing peer. |
-| 12 | CHUNK_NAK | 32-byte file ID + `uint32 chunk_index` + `uint8 reason` | Live handler sends NOT_STORED or HASH_MISMATCH; requester advances to another owner. |
+| 12 | CHUNK_NAK | 32-byte file ID + `uint32 chunk_index` + `uint8 reason` | Live handler sends NOT_STORED, BUSY, or HASH_MISMATCH; requester advances to another owner. |
 | 13 | CHUNK_ACK | 32-byte file ID + `uint32 chunk_index` + `uint32 cumulative_offset` + `uint32 bitmap` | Live handler acknowledges received fragments and supports selective retransmission in 32-fragment windows. |
 | 14 | CHUNK_HASH | 32-byte file ID + `uint32 chunk_index` + 32-byte SHA-256 digest | Live catalog exchange distributes each chunk's expected digest; receivers verify before storing. |
 | 15 | CHUNK_HASH_ACK | 32-byte file ID + `uint32 chunk_index` | Acknowledges receipt of the matching CHUNK_HASH; sender retries the same datagram when this ACK is missing. |
@@ -188,7 +188,7 @@ uint32 chunk_index
 uint8 reason
 ```
 
-Reason codes are `1 = NOT_STORED`, `2 = BUSY`, and `3 = HASH_MISMATCH`. Header `seq_no` and `ack_no` are zero. It tells the requester that the selected owner cannot provide this chunk or the data failed integrity checking, so the requester proceeds to another known owner. CHUNK_NAK is not retransmitted. The live handler sends NOT_STORED for unavailable chunks and HASH_MISMATCH when a received chunk digest differs from the catalog; BUSY is reserved.
+Reason codes are `1 = NOT_STORED`, `2 = BUSY`, and `3 = HASH_MISMATCH`. Header `seq_no` and `ack_no` are zero. It tells the requester that the selected owner cannot provide this chunk or the data failed integrity checking, so the requester proceeds to another known owner. CHUNK_NAK is not retransmitted. The live handler sends NOT_STORED for unavailable chunks, BUSY when all four outgoing chunk-transfer slots are occupied, and HASH_MISMATCH when a received chunk digest differs from the catalog.
 
 ### CHUNK_HASH (type 14) - expected digest for one chunk
 
@@ -315,7 +315,7 @@ After a graceful LEAVE or heartbeat timeout, each peer removes the departed owne
 
 When a peer joins, it uses the current peer IDs and bounded HRW placement algorithm to find chunks assigned to it. Existing owners send `FILE_LIST`, `CHUNK_HASH`, and `CHUNK_HAVE`; the joining peer waits for each expected digest, requests its missing assigned chunks with ranged `CHUNK_REQUEST`, verifies and stores the data, and announces ownership with `CHUNK_HAVE`.
 
-Limitations: initial placement runs when `/index` is issued and needs three known peers and at least two chunks. Join rebalancing adds the joining peer's assigned copies but retains older replicas, so extras can remain. Four-peer placement, multi-source download, source-crash failover, and re-replication passed the supplied localhost integration test. Packet-loss simulation and live hash-mismatch fallback still need targeted tests; BUSY NAK and safe removal of surplus replicas are not implemented.
+Limitations: initial placement runs when `/index` is issued and needs three known peers and at least two chunks. Join rebalancing adds the joining peer's assigned copies but retains older replicas, so extras can remain. Four-peer placement, multi-source download, source-crash failover, and re-replication passed the supplied localhost integration test. Packet-loss simulation, saturated-source BUSY failover, and live hash-mismatch fallback still need targeted tests; safe removal of surplus replicas is not implemented.
 
 ## 7. Current implementation inventory
 
@@ -327,6 +327,7 @@ Limitations: initial placement runs when `/index` is issued and needs three know
 - File SHA-256 helper and a local two-fragment CHUNK_DATA reassembly demonstration.
 - In-memory FILE_LIST/CHUNK_HAVE catalog exchange, REPLICATE_REQ placement, and on-disk chunk store.
 - Basic live ranged CHUNK_REQUEST/CHUNK_DATA transfer, an adaptive sliding download pool of up to four chunks, request retries/failover, and whole-file SHA-256 verification.
+- Chunk serving is limited to four concurrent outgoing transfers; excess requests receive CHUNK_NAK/BUSY so the requester can try another owner.
 - Bounded HRW placement, a requested 4 MiB socket receive buffer, paced CHUNK_DATA bursts, and CRC-32 membership-view repair.
 - Binary UDP membership with JOIN retries, ID assignment and peer snapshots in JOIN_ACK, NEW_PEER announcements, HEARTBEAT/LEAVE, heartbeat-view repair, and timeout removal. Four-peer localhost membership and crash timeout were observed by the supplied integration test.
 - Local screenshots show three-peer discovery, heartbeat/timeout behavior, and graceful leave behavior.
