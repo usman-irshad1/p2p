@@ -4,7 +4,19 @@ A student project to build a multi-peer group chat and file-sharing application 
 
 ## Project status
 
-**Status:** The PDF's small-group protocol improvements are implemented in code and documented; live multi-peer verification is still pending. Placement uses bounded HRW hashing, downloads use ranged requests with resume/failover and a sliding worker pool, and peers compare membership-view hashes.
+**Status:** Code is in place for all five numbered prototype changes in the PDF's “Changes from the current prototype” section. Live multi-peer verification is still pending.
+
+### Progress against `protocol_improvements.pdf`
+
+**Implementation: 5/5 numbered prototype changes present in code. Live verification: pending.** This count covers the PDF's five-item change list, not every general option or future improvement discussed elsewhere in the study.
+
+1. [x] Selective `CHUNK_ACK`: 32-fragment windows; retransmit fragments that remain unacknowledged.
+2. [x] Pace `CHUNK_DATA` bursts and request a 4 MiB UDP receive buffer.
+3. [x] Adaptive per-peer RTO, failover after three RTOs without progress, and a sliding pool that starts another chunk when a worker finishes.
+4. [x] Ranged `CHUNK_REQUEST` with resume offsets, `CHUNK_NAK` failover, and per-chunk SHA-256 metadata/checking (`CHUNK_HASH`).
+5. [x] Bootstrap ID assignment, heartbeat membership-view hashes and repair, and bounded HRW placement across at least three peers.
+
+These items are implemented in the current code. They still need the live four-peer, loss, source-failure, replica-count, and integrity checks listed below before being called demonstrated or verified.
 
 ### Implemented or prototyped
 
