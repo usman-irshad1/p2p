@@ -7,7 +7,9 @@ import time
 import struct
 import os
 import hashlib
+import zlib
 from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import protocol_design
 import file_catalog as file_catalog_helpers
 import chunk_store
@@ -17,6 +19,7 @@ peers = []
 last_seen = {}
 bootstrap_addr = None
 joined_network = False
+peer_id = 0
 peer_lock = threading.Lock()
 sequence_lock = threading.Lock()
 chat_state_lock = threading.Lock()
@@ -24,12 +27,19 @@ file_catalog_lock = threading.RLock()
 chunk_download_lock = threading.Lock()
 chunk_send_lock = threading.Lock()
 chunk_hash_lock = threading.Lock()
+file_list_lock = threading.Lock()
+chunk_have_lock = threading.Lock()
+rtt_lock = threading.Lock()
 outgoing_chat_queues = {}
 pending_chats = {}
 file_catalog_state = file_catalog_helpers.create_catalog()
 pending_chunk_have = set()
 pending_chunk_hashes = {}
 pending_chunk_hash_acks = {}
+pending_file_list_acks = {}
+pending_chunk_have_acks = {}
+peer_rtt_state = {}
+peer_view_mismatch_counts = {}
 pending_chunk_downloads = {}
 pending_chunk_sends = {}
 pending_replication_requests = set()
@@ -46,22 +56,32 @@ expected_packet_sequence_by_peer = {}
 expected_chat_sequence_by_peer = {}
 received_chat_pairs_by_peer = {}
 
-HEARTBEAT_INTERVAL = 5
-PEER_TIMEOUT = 15
-CHAT_RETRY_INTERVAL = 1
+HEARTBEAT_INTERVAL = 2
+PEER_TIMEOUT = 6
+JOIN_ACK_TIMEOUT = 1
+JOIN_RETRIES = 5
+CHAT_WINDOW = 8
+INITIAL_RTO = 1.0
+MIN_RTO = 0.2
+MAX_RTO = 3.0
 DEFAULT_CHUNK_SIZE = 256 * 1024
 CHUNK_STORE_DIR = os.path.join(os.path.dirname(__file__), "peer_chunks")
 CHUNK_FRAGMENT_DATA_SIZE = (
     protocol_design.MAX_DATAGRAM_SIZE - protocol_design.header_size - 44
 )
-CHUNK_REQUEST_TIMEOUT = 5
-CHUNK_ACK_TIMEOUT = 0.75
+CHUNK_REQUEST_TIMEOUT = 3 * INITIAL_RTO
 CHUNK_FRAGMENT_RETRIES = 5
 CHUNK_SEND_WINDOW = 32
+CHUNK_SEND_BURST_SIZE = 8
+SOCKET_RECEIVE_BUFFER_SIZE = 4 * 1024 * 1024
 CHUNK_HASH_ACK_TIMEOUT = 1
 CHUNK_HASH_RETRIES = 5
+FILE_LIST_ACK_TIMEOUT = 1
+FILE_LIST_RETRIES = 5
+CHUNK_HAVE_ACK_TIMEOUT = 1
+CHUNK_HAVE_RETRIES = 5
 CHUNK_REPAIR_RETRY_INTERVAL = CHUNK_REQUEST_TIMEOUT * 2
-MIN_DISTRIBUTION_PEERS = 4
+MIN_DISTRIBUTION_PEERS = 3
 MAX_FILE_LIST_FILENAME_BYTES = (
     protocol_design.MAX_DATAGRAM_SIZE
     - protocol_design.header_size
@@ -74,6 +94,57 @@ def peer_snapshot():
     """Return a stable snapshot of the current peer ID/address pairs."""
     with peer_lock:
         return tuple(peers)
+
+
+def get_peer_rto(known_id):
+    """Return the current per-peer retransmission timeout."""
+    with rtt_lock:
+        state = peer_rtt_state.get(known_id)
+        return INITIAL_RTO if state is None else state["rto"]
+
+
+def update_peer_rtt(known_id, sample):
+    """Update SRTT, RTTVAR, and bounded RTO using an unambiguous sample."""
+    if sample <= 0:
+        return
+
+    with rtt_lock:
+        state = peer_rtt_state.get(known_id)
+        if state is None:
+            srtt = sample
+            rttvar = sample / 2
+        else:
+            srtt = state["srtt"]
+            rttvar = 0.75 * state["rttvar"] + 0.25 * abs(srtt - sample)
+            srtt = 0.875 * srtt + 0.125 * sample
+
+        peer_rtt_state[known_id] = {
+            "srtt": srtt,
+            "rttvar": rttvar,
+            "rto": min(MAX_RTO, max(MIN_RTO, srtt + 4 * rttvar)),
+        }
+
+
+def peer_view_hash():
+    """Hash the sorted IDs in this peer's active membership view."""
+    active_ids = sorted({peer_id, *(known_id for known_id, _ in peer_snapshot())})
+    packed_ids = b"".join(struct.pack("!H", known_id) for known_id in active_ids)
+    return len(active_ids), zlib.crc32(packed_ids) & 0xFFFFFFFF
+
+
+def send_peer_list_request(destination_id, destination_addr):
+    """Ask a peer for its current membership view after a mismatch."""
+    datagram = protocol_design.make_datagram(
+        packet_name="PEER_LIST_REQ",
+        peer_id=peer_id,
+        destination_p_id=destination_id,
+        protocol_version=protocol_design.PROTOCOL_VERSION,
+        flags=0,
+        group_id=0,
+        seq_no=0,
+        payload=None,
+    )
+    server.sendto(datagram, destination_addr)
 
 
 def add_peer(peer_id, peer_addr):
@@ -101,6 +172,9 @@ def remove_peer(peer_id, peer_addr=None):
 
     if removed:
         last_seen.pop(peer_id, None)
+        peer_view_mismatch_counts.pop(peer_id, None)
+        with rtt_lock:
+            peer_rtt_state.pop(peer_id, None)
         clear_peer_sequence_state(peer_id)
         clear_pending_chat(peer_id)
         with file_catalog_lock:
@@ -118,6 +192,14 @@ def remove_peer(peer_id, peer_addr=None):
             for hash_key in tuple(pending_chunk_hash_acks):
                 if hash_key[0] == peer_id:
                     pending_chunk_hash_acks.pop(hash_key, None)
+        with file_list_lock:
+            for file_list_key in tuple(pending_file_list_acks):
+                if file_list_key[0] == peer_id:
+                    pending_file_list_acks.pop(file_list_key, None)
+        with chunk_have_lock:
+            for chunk_have_key in tuple(pending_chunk_have_acks):
+                if chunk_have_key[0] == peer_id:
+                    pending_chunk_have_acks.pop(chunk_have_key, None)
 
     return removed
 
@@ -260,23 +342,23 @@ def send_file_catalog_to_peer(destination_id, destination_addr):
         )
         if len(datagram) > protocol_design.MAX_DATAGRAM_SIZE:
             raise ValueError("A FILE_LIST record exceeds the 1,024-byte limit")
+        if file_records:
+            file_id = file_records[0][0]
+            key = (destination_id, file_id)
+            with file_list_lock:
+                pending_file_list_acks[key] = {
+                    "addr": destination_addr,
+                    "datagram": datagram,
+                    "last_sent": time.monotonic(),
+                    "retries": 0,
+                }
         server.sendto(datagram, destination_addr)
 
     for file_id, chunk_index, chunk_hash in chunk_hashes:
         send_chunk_hash(destination_id, destination_addr, file_id, chunk_index, chunk_hash)
 
     for file_id, chunk_index in local_chunks:
-        datagram = protocol_design.make_datagram(
-            packet_name="CHUNK_HAVE",
-            peer_id=peer_id,
-            destination_p_id=destination_id,
-            protocol_version=protocol_design.PROTOCOL_VERSION,
-            flags=0,
-            group_id=0,
-            seq_no=0,
-            payload=(file_id, chunk_index),
-        )
-        server.sendto(datagram, destination_addr)
+        send_chunk_have(destination_id, destination_addr, file_id, chunk_index)
 
 
 def broadcast_file_catalog():
@@ -285,29 +367,57 @@ def broadcast_file_catalog():
         send_file_catalog_to_peer(destination_id, destination_addr)
 
 
-def plan_chunk_owners(chunk_count, participant_ids):
-    """Assign two balanced, distinct peer owners to each chunk."""
+def plan_chunk_owners(file_id, chunk_count, participant_ids):
+    """Assign two chunk owners with bounded rendezvous (HRW) hashing."""
+    if not isinstance(file_id, bytes) or len(file_id) != 32:
+        raise ValueError("file_id must be a 32-byte SHA-256 hash")
     participant_ids = tuple(sorted(set(participant_ids)))
-    if len(participant_ids) < 2:
-        raise ValueError("At least two peers are required for replication")
+    if len(participant_ids) < 3:
+        raise ValueError("At least three peers are required for bounded replication")
+    if chunk_count < 2:
+        raise ValueError("At least two chunks are required to avoid a full-file copy")
 
-    load_by_peer = {known_id: 0 for known_id in participant_ids}
+    rankings = {}
     placement = {}
-    peer_count = len(participant_ids)
-
     for chunk_index in range(chunk_count):
-        tie_order = {
-            known_id: (position - chunk_index) % peer_count
-            for position, known_id in enumerate(participant_ids)
+        scores = {
+            known_id: hashlib.sha256(
+                file_id + struct.pack("!IH", chunk_index, known_id)
+            ).digest()
+            for known_id in participant_ids
         }
-        ranked = sorted(
-            participant_ids,
-            key=lambda known_id: (load_by_peer[known_id], tie_order[known_id]),
+        ranked = tuple(
+            sorted(
+                participant_ids,
+                key=lambda known_id: (scores[known_id], -known_id),
+                reverse=True,
+            )
         )
-        owners = tuple(ranked[:2])
-        placement[chunk_index] = owners
-        for owner_id in owners:
-            load_by_peer[owner_id] += 1
+        rankings[chunk_index] = (ranked, scores)
+        placement[chunk_index] = ranked[:2]
+
+    # If HRW happens to put one peer in every chunk's top two, move its
+    # lowest-scoring assignment to that chunk's third-ranked peer.
+    while True:
+        full_file_owners = [
+            known_id
+            for known_id in participant_ids
+            if all(known_id in owners for owners in placement.values())
+        ]
+        if not full_file_owners:
+            break
+
+        known_id = full_file_owners[0]
+        lowest_chunk = min(
+            placement,
+            key=lambda index: rankings[index][1][known_id],
+        )
+        ranked, _ = rankings[lowest_chunk]
+        other_owner = next(
+            owner for owner in placement[lowest_chunk] if owner != known_id
+        )
+        replacement = next(owner for owner in ranked[2:] if owner != other_owner)
+        placement[lowest_chunk] = (other_owner, replacement)
 
     return placement
 
@@ -325,7 +435,7 @@ def distribute_file_chunks(file_id):
     participants = tuple(sorted(participants))
     placement = {}
     if len(participants) >= MIN_DISTRIBUTION_PEERS and chunk_count >= 2:
-        placement = plan_chunk_owners(chunk_count, participants)
+        placement = plan_chunk_owners(file_id, chunk_count, participants)
 
     with file_catalog_lock:
         metadata = file_catalog_state[file_id]
@@ -500,7 +610,7 @@ def rebalance_chunks_for_local_peer():
 
     tasks_started = 0
     for file_id, chunk_count, known_hash_indices, chunk_owners in file_entries:
-        placement = plan_chunk_owners(chunk_count, participants)
+        placement = plan_chunk_owners(file_id, chunk_count, participants)
         for chunk_index, designated_owners in placement.items():
             if peer_id not in designated_owners:
                 continue
@@ -649,6 +759,59 @@ def send_chunk_hash_ack(destination_id, destination_addr, file_id, chunk_index):
     server.sendto(datagram, destination_addr)
 
 
+def send_file_list_ack(destination_id, destination_addr, file_id):
+    """Acknowledge receipt of one file's catalog metadata."""
+    datagram = protocol_design.make_datagram(
+        packet_name="FILE_LIST_ACK",
+        peer_id=peer_id,
+        destination_p_id=destination_id,
+        protocol_version=protocol_design.PROTOCOL_VERSION,
+        flags=0,
+        group_id=0,
+        seq_no=0,
+        payload=file_id,
+    )
+    server.sendto(datagram, destination_addr)
+
+
+def send_chunk_have(destination_id, destination_addr, file_id, chunk_index):
+    """Announce locally stored chunk ownership and retain it until ACKed."""
+    datagram = protocol_design.make_datagram(
+        packet_name="CHUNK_HAVE",
+        peer_id=peer_id,
+        destination_p_id=destination_id,
+        protocol_version=protocol_design.PROTOCOL_VERSION,
+        flags=0,
+        group_id=0,
+        seq_no=0,
+        payload=(file_id, chunk_index),
+    )
+    key = (destination_id, file_id, chunk_index)
+    with chunk_have_lock:
+        pending_chunk_have_acks[key] = {
+            "addr": destination_addr,
+            "datagram": datagram,
+            "last_sent": time.monotonic(),
+            "retries": 0,
+        }
+    server.sendto(datagram, destination_addr)
+
+
+def send_chunk_have_ack(destination_id, destination_addr, file_id, chunk_index):
+    """Acknowledge a received chunk-ownership announcement."""
+    datagram = protocol_design.make_datagram(
+        packet_name="CHUNK_HAVE_ACK",
+        peer_id=peer_id,
+        destination_p_id=destination_id,
+        protocol_version=protocol_design.PROTOCOL_VERSION,
+        flags=0,
+        group_id=0,
+        seq_no=0,
+        payload=(file_id, chunk_index),
+    )
+    server.sendto(datagram, destination_addr)
+
+
 def retry_chunk_hashes():
     """Retry unacknowledged chunk hashes five times, then drop pending state."""
     while True:
@@ -675,7 +838,66 @@ def retry_chunk_hashes():
         time.sleep(CHUNK_HASH_ACK_TIMEOUT / 2)
 
 
-def send_chunk_data(destination_id, destination_addr, file_id, chunk_index):
+def retry_file_lists():
+    """Retry unacknowledged FILE_LIST records up to five times."""
+    while True:
+        now = time.monotonic()
+        due_datagrams = []
+        with file_list_lock:
+            for key, state in tuple(pending_file_list_acks.items()):
+                if now - state["last_sent"] < FILE_LIST_ACK_TIMEOUT:
+                    continue
+                if state["retries"] >= FILE_LIST_RETRIES:
+                    pending_file_list_acks.pop(key, None)
+                    continue
+
+                state["retries"] += 1
+                state["last_sent"] = now
+                due_datagrams.append((state["datagram"], state["addr"]))
+
+        for datagram, destination_addr in due_datagrams:
+            try:
+                server.sendto(datagram, destination_addr)
+            except OSError:
+                pass
+
+        time.sleep(FILE_LIST_ACK_TIMEOUT / 2)
+
+
+def retry_chunk_have():
+    """Retry unacknowledged CHUNK_HAVE announcements up to five times."""
+    while True:
+        now = time.monotonic()
+        due_datagrams = []
+        with chunk_have_lock:
+            for key, state in tuple(pending_chunk_have_acks.items()):
+                if now - state["last_sent"] < CHUNK_HAVE_ACK_TIMEOUT:
+                    continue
+                if state["retries"] >= CHUNK_HAVE_RETRIES:
+                    pending_chunk_have_acks.pop(key, None)
+                    continue
+
+                state["retries"] += 1
+                state["last_sent"] = now
+                due_datagrams.append((state["datagram"], state["addr"]))
+
+        for datagram, destination_addr in due_datagrams:
+            try:
+                server.sendto(datagram, destination_addr)
+            except OSError:
+                pass
+
+        time.sleep(CHUNK_HAVE_ACK_TIMEOUT / 2)
+
+
+def send_chunk_data(
+    destination_id,
+    destination_addr,
+    file_id,
+    chunk_index,
+    start_offset=0,
+    length=None,
+):
     """Send a chunk in 32-fragment windows and retry fragments lacking ACKs."""
     try:
         chunk_data = chunk_store.load_chunk(
@@ -686,8 +908,18 @@ def send_chunk_data(destination_id, destination_addr, file_id, chunk_index):
     except (OSError, KeyError):
         return
     total_chunk_size = len(chunk_data)
+    if length is None:
+        length = total_chunk_size - start_offset
+    end_offset = start_offset + length
+    if (
+        start_offset < 0
+        or start_offset % CHUNK_FRAGMENT_DATA_SIZE != 0
+        or length <= 0
+        or end_offset > total_chunk_size
+    ):
+        return
     fragments = []
-    for fragment_offset in range(0, total_chunk_size, CHUNK_FRAGMENT_DATA_SIZE):
+    for fragment_offset in range(start_offset, end_offset, CHUNK_FRAGMENT_DATA_SIZE):
         fragment_data = chunk_data[
             fragment_offset:fragment_offset + CHUNK_FRAGMENT_DATA_SIZE
         ]
@@ -709,6 +941,8 @@ def send_chunk_data(destination_id, destination_addr, file_id, chunk_index):
         "total_size": total_chunk_size,
         "fragments": fragments,
         "acked": set(),
+        "first_sent": {},
+        "retransmitted": set(),
         "error": None,
         "event": threading.Event(),
     }
@@ -734,11 +968,21 @@ def send_chunk_data(destination_id, destination_addr, file_id, chunk_index):
                 if not missing_offsets:
                     break
 
+                sent_in_burst = 0
                 for fragment_offset, datagram in fragments[window_start:window_end]:
                     if fragment_offset in missing_offsets:
+                        with chunk_send_lock:
+                            if fragment_offset in send_state["first_sent"]:
+                                send_state["retransmitted"].add(fragment_offset)
+                            else:
+                                send_state["first_sent"][fragment_offset] = time.monotonic()
                         server.sendto(datagram, destination_addr)
+                        sent_in_burst += 1
+                        if sent_in_burst >= CHUNK_SEND_BURST_SIZE:
+                            time.sleep(0.001)
+                            sent_in_burst = 0
 
-                send_state["event"].wait(CHUNK_ACK_TIMEOUT)
+                send_state["event"].wait(get_peer_rto(destination_id))
                 with chunk_send_lock:
                     if send_state["error"] is not None:
                         return
@@ -755,8 +999,25 @@ def send_chunk_data(destination_id, destination_addr, file_id, chunk_index):
                 pending_chunk_sends.pop(transfer_key, None)
 
 
-def request_chunk(file_id, chunk_index, preferred_owner_id=None, preferred_addr=None):
-    """Request a chunk from known owners, trying another peer after timeout."""
+def contiguous_chunk_offset(fragments):
+    """Return the first byte offset not present in a fragment map."""
+    offset = 0
+    while offset in fragments:
+        offset += len(fragments[offset])
+    return offset
+
+
+def request_chunk(
+    file_id,
+    chunk_index,
+    preferred_owner_id=None,
+    preferred_addr=None,
+    owner_order=None,
+    source_loads=None,
+    source_load_lock=None,
+    source_reservation=None,
+):
+    """Request a chunk, resume at the first missing byte, and fail over quickly."""
     with file_catalog_lock:
         metadata = file_catalog_state.get(file_id)
         if metadata is None:
@@ -784,57 +1045,117 @@ def request_chunk(file_id, chunk_index, preferred_owner_id=None, preferred_addr=
         raise ValueError("The requested chunk has no data")
 
     peer_addresses = dict(peer_snapshot())
+    catalog_owners = owners
     if preferred_owner_id is not None:
         owners = (preferred_owner_id,)
         if peer_addresses.get(preferred_owner_id) != preferred_addr:
             raise ValueError("Replication request came from an unknown peer")
+    elif owner_order is not None:
+        owners = tuple(owner_order) + tuple(
+            owner_id for owner_id in catalog_owners if owner_id not in owner_order
+        )
     elif owners:
         start = chunk_index % len(owners)
         owners = owners[start:] + owners[:start]
-    for owner_id in owners:
-        if owner_id == peer_id or owner_id not in peer_addresses:
-            continue
+    key = (file_id, chunk_index)
+    download_state = {
+        "owner_id": None,
+        "owner_addr": None,
+        "expected_size": expected_size,
+        "expected_hash": expected_chunk_hash,
+        "total_size": expected_size,
+        "fragments": {},
+        "event": threading.Event(),
+        "error": None,
+        "error_reason": None,
+        "last_progress": time.monotonic(),
+    }
 
-        owner_addr = peer_addresses[owner_id]
-        event = threading.Event()
-        key = (file_id, chunk_index)
-        download_state = {
-            "owner_id": owner_id,
-            "owner_addr": owner_addr,
-            "expected_size": expected_size,
-            "expected_hash": expected_chunk_hash,
-            "total_size": None,
-            "fragments": {},
-            "event": event,
-            "error": None,
-        }
+    with chunk_download_lock:
+        if key in pending_chunk_downloads:
+            raise ValueError("This chunk is already being downloaded")
+        pending_chunk_downloads[key] = download_state
 
-        with chunk_download_lock:
-            if key in pending_chunk_downloads:
-                raise ValueError("This chunk is already being downloaded")
-            pending_chunk_downloads[key] = download_state
+    try:
+        for owner_id in owners:
+            if owner_id == peer_id or owner_id not in peer_addresses:
+                continue
 
-        try:
-            request_datagram = protocol_design.make_datagram(
-                packet_name="CHUNK_REQUEST",
-                peer_id=peer_id,
-                destination_p_id=owner_id,
-                protocol_version=protocol_design.PROTOCOL_VERSION,
-                flags=0,
-                group_id=0,
-                seq_no=0,
-                payload=(file_id, chunk_index),
-            )
-            for attempt in range(3):
-                server.sendto(request_datagram, owner_addr)
-                if event.wait(CHUNK_REQUEST_TIMEOUT / 3):
-                    if download_state["error"] is None:
-                        announce_chunk_have(file_id, chunk_index)
-                        return True
-                    break
-        finally:
+            owner_addr = peer_addresses[owner_id]
+            if source_loads is not None and source_load_lock is not None:
+                with source_load_lock:
+                    reserved_owner_id = (
+                        source_reservation.get("owner_id")
+                        if source_reservation is not None
+                        else None
+                    )
+                    if reserved_owner_id != owner_id:
+                        if source_loads.get(owner_id, 0) >= 2:
+                            continue
+                        if reserved_owner_id is not None:
+                            source_loads[reserved_owner_id] = max(
+                                0,
+                                source_loads.get(reserved_owner_id, 1) - 1,
+                            )
+                        source_loads[owner_id] = source_loads.get(owner_id, 0) + 1
+                        if source_reservation is not None:
+                            source_reservation["owner_id"] = owner_id
+            timeout = get_peer_rto(owner_id)
             with chunk_download_lock:
-                pending_chunk_downloads.pop(key, None)
+                download_state["owner_id"] = owner_id
+                download_state["owner_addr"] = owner_addr
+                download_state["error"] = None
+                download_state["error_reason"] = None
+                download_state["event"].clear()
+
+            while True:
+                with chunk_download_lock:
+                    start_offset = contiguous_chunk_offset(
+                        download_state["fragments"]
+                    )
+                    if start_offset >= expected_size:
+                        download_state["event"].set()
+                    last_progress = download_state["last_progress"]
+                    current_error = download_state["error"]
+
+                if download_state["event"].is_set():
+                    if current_error is None:
+                        announce_chunk_have(file_id, chunk_index)
+                        return (
+                            source_reservation.get("owner_id", owner_id)
+                            if source_reservation is not None
+                            else owner_id
+                        )
+                    if download_state["error_reason"] == protocol_design.CHUNK_NAK_REASONS["HASH_MISMATCH"]:
+                        with chunk_download_lock:
+                            download_state["fragments"].clear()
+                            download_state["last_progress"] = time.monotonic()
+                    break
+
+                if time.monotonic() - last_progress >= 3 * timeout:
+                    break
+
+                request_datagram = protocol_design.make_datagram(
+                    packet_name="CHUNK_REQUEST",
+                    peer_id=peer_id,
+                    destination_p_id=owner_id,
+                    protocol_version=protocol_design.PROTOCOL_VERSION,
+                    flags=0,
+                    group_id=0,
+                    seq_no=0,
+                    payload=(
+                        file_id,
+                        chunk_index,
+                        start_offset,
+                        expected_size - start_offset,
+                    ),
+                )
+                server.sendto(request_datagram, owner_addr)
+                download_state["event"].wait(timeout)
+
+    finally:
+        with chunk_download_lock:
+            pending_chunk_downloads.pop(key, None)
 
     raise TimeoutError(
         f"No peer delivered chunk {chunk_index} of {file_id.hex()[:8]}"
@@ -895,12 +1216,28 @@ def maybe_release_staged_chunk(file_id, chunk_index):
     return False
 
 
-def download_one_chunk(file_id, chunk_index, errors):
+def download_one_chunk(
+    file_id,
+    chunk_index,
+    errors,
+    owner_order,
+    source_loads,
+    source_load_lock,
+    source_reservation,
+):
     """Worker used by download_file to fetch one chunk independently."""
     try:
-        request_chunk(file_id, chunk_index)
+        return request_chunk(
+            file_id,
+            chunk_index,
+            owner_order=owner_order,
+            source_loads=source_loads,
+            source_load_lock=source_load_lock,
+            source_reservation=source_reservation,
+        )
     except Exception as error:
         errors[chunk_index] = str(error)
+        return None
 
 
 def download_file(file_id, destination_path):
@@ -911,34 +1248,105 @@ def download_file(file_id, destination_path):
             raise ValueError("File ID is not in the catalog")
         chunk_count = metadata["chunk_count"]
         filename = metadata["filename"]
+        owners_by_chunk = {
+            chunk_index: tuple(metadata["chunk_owners"][chunk_index])
+            for chunk_index in range(chunk_count)
+        }
 
     if not destination_path:
         destination_path = os.path.join("downloads", filename)
 
     errors = {}
-    # Limit each batch to four concurrent chunk downloads.
-    for batch_start in range(0, chunk_count, 4):
-        batch_end = min(batch_start + 4, chunk_count)
-        workers = [
-            threading.Thread(
-                target=download_one_chunk,
-                args=(file_id, chunk_index, errors),
-            )
-            for chunk_index in range(batch_start, batch_end)
-            if not chunk_store.has_chunk(
-                CHUNK_STORE_DIR, file_id, chunk_index
-            )
-        ]
-        for worker in workers:
-            worker.start()
-        for worker in workers:
-            worker.join()
+    missing_chunks = [
+        chunk_index
+        for chunk_index in range(chunk_count)
+        if not chunk_store.has_chunk(CHUNK_STORE_DIR, file_id, chunk_index)
+    ]
+    source_loads = {}
+    source_load_lock = threading.Lock()
+    active = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        while missing_chunks or active:
+            while missing_chunks and len(active) < 4:
+                with source_load_lock:
+                    available = [
+                        chunk_index
+                        for chunk_index in missing_chunks
+                        if any(
+                            source_loads.get(owner_id, 0) < 2
+                            for owner_id in owners_by_chunk[chunk_index]
+                        )
+                    ]
+                    if not available:
+                        break
+                    rarest_count = min(
+                        len(owners_by_chunk[chunk_index])
+                        for chunk_index in available
+                    )
+                    rarest = [
+                        chunk_index
+                        for chunk_index in available
+                        if len(owners_by_chunk[chunk_index]) == rarest_count
+                    ]
+                    chunk_index = random.choice(rarest)
+                    owner_order = tuple(
+                        owner_id
+                        for owner_id in sorted(
+                            owners_by_chunk[chunk_index],
+                            key=lambda owner_id: (
+                                source_loads.get(owner_id, 0),
+                                random.random(),
+                            ),
+                        )
+                        if source_loads.get(owner_id, 0) < 2
+                    )
+                    primary_owner = owner_order[0] if owner_order else None
+                    if primary_owner is not None:
+                        source_loads[primary_owner] = (
+                            source_loads.get(primary_owner, 0) + 1
+                        )
+                if primary_owner is None:
+                    missing_chunks.remove(chunk_index)
+                    errors[chunk_index] = "No known chunk owners"
+                    continue
+                source_reservation = {"owner_id": primary_owner}
+                future = executor.submit(
+                    download_one_chunk,
+                    file_id,
+                    chunk_index,
+                    errors,
+                    owner_order,
+                    source_loads,
+                    source_load_lock,
+                    source_reservation,
+                )
+                active[future] = (chunk_index, source_reservation)
+                missing_chunks.remove(chunk_index)
 
-        if errors:
-            chunk_index = min(errors)
-            raise TimeoutError(
-                f"Could not download chunk {chunk_index}: {errors[chunk_index]}"
-            )
+            if not active:
+                for chunk_index in missing_chunks:
+                    errors[chunk_index] = "No available peer owns this chunk"
+                break
+
+            completed, _ = wait(active, return_when=FIRST_COMPLETED)
+            for future in completed:
+                chunk_index, source_reservation = active.pop(future)
+                actual_owner = future.result()
+                reserved_owner_id = source_reservation.get("owner_id")
+                if reserved_owner_id is not None:
+                    with source_load_lock:
+                        source_loads[reserved_owner_id] = max(
+                            0,
+                            source_loads.get(reserved_owner_id, 1) - 1,
+                        )
+                if actual_owner is None and chunk_index not in errors:
+                    errors[chunk_index] = "No peer delivered this chunk"
+
+    if errors:
+        chunk_index = min(errors)
+        raise TimeoutError(
+            f"Could not download chunk {chunk_index}: {errors[chunk_index]}"
+        )
 
     return chunk_store.assemble_file(
         CHUNK_STORE_DIR,
@@ -960,17 +1368,7 @@ def announce_chunk_have(file_id, chunk_index):
 
     recipients = peer_snapshot()
     for destination_id, destination_addr in recipients:
-        datagram = protocol_design.make_datagram(
-            packet_name="CHUNK_HAVE",
-            peer_id=peer_id,
-            destination_p_id=destination_id,
-            protocol_version=protocol_design.PROTOCOL_VERSION,
-            flags=0,
-            group_id=0,
-            seq_no=0,
-            payload=(file_id, chunk_index),
-        )
-        server.sendto(datagram, destination_addr)
+        send_chunk_have(destination_id, destination_addr, file_id, chunk_index)
     return len(recipients)
 
 
@@ -1010,6 +1408,10 @@ def queue_group_chat(text):
     """Queue this chat separately for every peer currently in the group."""
     # Validate the UTF-8 byte limit before placing the message in any queue.
     protocol_design.make_chat_payload(1, text)
+    if peer_id == 0 or not joined_network:
+        print("Waiting to join the peer network before sending chat.")
+        return
+
     recipients = peer_snapshot()
 
     if not recipients:
@@ -1025,56 +1427,55 @@ def clear_pending_chat(removed_peer_id):
     """Drop queued and unacknowledged chats after a peer leaves or times out."""
     with chat_state_lock:
         queue_for_peer = outgoing_chat_queues.pop(removed_peer_id, deque())
-        pending = pending_chats.pop(removed_peer_id, None)
+        pending = pending_chats.pop(removed_peer_id, {})
 
     if pending is not None or queue_for_peer:
         print(f"Chat delivery to peer {removed_peer_id} failed; peer was removed")
 
 
 def chat_sender():
-    """Send one CHAT at a time per peer and retry it unchanged until ACKed."""
+    """Keep an eight-message per-peer window and retry each message by its RTO."""
     while True:
         now = time.monotonic()
 
         for destination_id, destination_addr in peer_snapshot():
-            datagram_to_send = None
+            datagrams_to_send = []
 
             with chat_state_lock:
-                pending = pending_chats.get(destination_id)
-
-                if pending is not None and pending["acknowledged"]:
-                    pending_chats.pop(destination_id, None)
-                    pending = None
-
-                if pending is not None:
-                    if now - pending["sent_at"] >= CHAT_RETRY_INTERVAL:
+                pending_by_sequence = pending_chats.setdefault(destination_id, {})
+                for pending in pending_by_sequence.values():
+                    if now - pending["sent_at"] >= pending["timeout"]:
                         pending["sent_at"] = now
-                        datagram_to_send = pending["datagram"]
-                else:
-                    queue_for_peer = outgoing_chat_queues.get(destination_id)
-                    if queue_for_peer:
-                        text = queue_for_peer.popleft()
-                        packet_sequence = next_packet_sequence(destination_id)
-                        chat_sequence = next_chat_sequence(destination_id)
-                        datagram_to_send = protocol_design.make_datagram(
-                            packet_name="CHAT",
-                            peer_id=peer_id,
-                            destination_p_id=destination_id,
-                            protocol_version=protocol_design.PROTOCOL_VERSION,
-                            flags=0,
-                            group_id=0,
-                            seq_no=packet_sequence,
-                            payload=(chat_sequence, text),
-                        )
-                        pending_chats[destination_id] = {
-                            "seq_no": packet_sequence,
-                            "datagram": datagram_to_send,
-                            "addr": destination_addr,
-                            "sent_at": now,
-                            "acknowledged": False,
-                        }
+                        pending["retransmitted"] = True
+                        pending["timeout"] = min(MAX_RTO, pending["timeout"] * 2)
+                        datagrams_to_send.append(pending["datagram"])
 
-            if datagram_to_send is not None:
+                queue_for_peer = outgoing_chat_queues.get(destination_id)
+                while queue_for_peer and len(pending_by_sequence) < CHAT_WINDOW:
+                    text = queue_for_peer.popleft()
+                    packet_sequence = next_packet_sequence(destination_id)
+                    chat_sequence = next_chat_sequence(destination_id)
+                    datagram_to_send = protocol_design.make_datagram(
+                        packet_name="CHAT",
+                        peer_id=peer_id,
+                        destination_p_id=destination_id,
+                        protocol_version=protocol_design.PROTOCOL_VERSION,
+                        flags=0,
+                        group_id=0,
+                        seq_no=packet_sequence,
+                        payload=(chat_sequence, text),
+                    )
+                    pending_by_sequence[packet_sequence] = {
+                            "seq_no": packet_sequence,
+                        "datagram": datagram_to_send,
+                        "addr": destination_addr,
+                        "sent_at": now,
+                        "timeout": get_peer_rto(destination_id),
+                        "retransmitted": False,
+                    }
+                    datagrams_to_send.append(datagram_to_send)
+
+            for datagram_to_send in datagrams_to_send:
                 server.sendto(datagram_to_send, destination_addr)
 
         time.sleep(0.05)
@@ -1102,7 +1503,8 @@ def chat_input():
                     print(f"Requested {replicas_requested} remote chunk copies.")
                 else:
                     print(
-                        "Distributed replication needs at least four joined peers "
+                        f"Distributed replication needs at least {MIN_DISTRIBUTION_PEERS} "
+                        "joined peers "
                         "and a file with at least two chunks."
                     )
             elif text.startswith("/download "):
@@ -1151,7 +1553,14 @@ def receive():
 
 
 def id_generation():
-    return random.randrange(1, 65535)
+    """Generate an ID that is unused in this peer's current group view."""
+    used_ids = {known_id for known_id, _ in peer_snapshot()}
+    if peer_id:
+        used_ids.add(peer_id)
+    available_ids = [candidate for candidate in range(1, 65535) if candidate not in used_ids]
+    if not available_ids:
+        raise RuntimeError("No unused peer IDs remain")
+    return random.choice(available_ids)
 
 
 def join_ack(joiner_addr, joining_id):
@@ -1161,32 +1570,89 @@ def join_ack(joiner_addr, joining_id):
         if known_id != joining_id:
             entries.append((known_id, known_addr[0], known_addr[1]))
 
-    peer_list_text = ";".join(
-        f"{known_id},{ip},{port}"
-        for known_id, ip, port in entries
+    datagram = protocol_design.make_datagram(
+        packet_name="JOIN_ACK",
+        peer_id=peer_id,
+        destination_p_id=joining_id,
+        protocol_version=protocol_design.PROTOCOL_VERSION,
+        flags=0,
+        group_id=0,
+        seq_no=0,
+        payload=entries,
     )
-
-    message = f"join_ack:{peer_list_text}".encode("utf-8")
-    server.sendto(message, joiner_addr)
+    server.sendto(datagram, joiner_addr)
 
 
 def join(peer_id, bootstrap_addr):
-    message = f"join:{peer_id}".encode("utf-8")
-    server.sendto(message, bootstrap_addr)
+    """Send a binary JOIN and retry it until the bootstrap assigns an ID."""
+    datagram = protocol_design.make_datagram(
+        packet_name="JOIN",
+        peer_id=0,
+        destination_p_id=0,
+        protocol_version=protocol_design.PROTOCOL_VERSION,
+        flags=0,
+        group_id=0,
+        seq_no=0,
+        payload=None,
+    )
+    server.sendto(datagram, bootstrap_addr)
+    threading.Thread(
+        target=retry_join,
+        args=(datagram, bootstrap_addr),
+        daemon=True,
+    ).start()
+
+
+def retry_join(datagram, bootstrap_addr):
+    """Repeat JOIN so a lost request or JOIN_ACK does not strand a newcomer."""
+    for _ in range(JOIN_RETRIES):
+        time.sleep(JOIN_ACK_TIMEOUT)
+        if joined_network:
+            return
+        try:
+            server.sendto(datagram, bootstrap_addr)
+        except OSError:
+            return
 
 
 def leave(peer_id):
-    message = f"leave:{peer_id}".encode("utf-8") #this to notify every peer that the peer is leavig so that they can remove the peer from their peer list
+    """Notify every known peer with a binary LEAVE packet."""
+    if peer_id == 0 or not joined_network:
+        return
     for known_id, peer_addr in peer_snapshot():
-        server.sendto(message, peer_addr)
+        datagram = protocol_design.make_datagram(
+            packet_name="LEAVE",
+            peer_id=peer_id,
+            destination_p_id=known_id,
+            protocol_version=protocol_design.PROTOCOL_VERSION,
+            flags=0,
+            group_id=0,
+            seq_no=0,
+            payload=None,
+        )
+        server.sendto(datagram, peer_addr)
 
 
 def heartbeat():
     while True:
-        message = f"heartbeat:{peer_id}".encode("utf-8")
+        if not joined_network or peer_id == 0:
+            time.sleep(HEARTBEAT_INTERVAL)
+            continue
+
+        peer_count, view_hash = peer_view_hash()
 
         for known_id, peer_addr in peer_snapshot():
-            server.sendto(message, peer_addr)
+            datagram = protocol_design.make_datagram(
+                packet_name="HEARTBEAT",
+                peer_id=peer_id,
+                destination_p_id=known_id,
+                protocol_version=protocol_design.PROTOCOL_VERSION,
+                flags=0,
+                group_id=0,
+                seq_no=0,
+                payload=(peer_count, view_hash),
+            )
+            server.sendto(datagram, peer_addr)
 
         now = time.monotonic()
 
@@ -1204,6 +1670,207 @@ def heartbeat():
 
         repair_under_replicated_chunks()
         time.sleep(HEARTBEAT_INTERVAL)
+
+
+def handle_membership_packet(message, addr):
+    """Handle all binary membership packets and repair peer-list differences."""
+    global peer_id, joined_network
+
+    if len(message) < protocol_design.header_size:
+        return False
+
+    packet_type = message[4]
+    membership_types = {
+        protocol_design.get_packet_type(name)
+        for name in (
+            "JOIN",
+            "JOIN_ACK",
+            "LEAVE",
+            "HEARTBEAT",
+            "NEW_PEER",
+            "PEER_LIST_REQ",
+        )
+    }
+    if packet_type not in membership_types:
+        return False
+
+    try:
+        fields = struct.unpack(
+            protocol_design.HEADER_FORMAT,
+            message[:protocol_design.header_size],
+        )
+        sender_id, destination_id = fields[0], fields[1]
+        request_type = protocol_design.get_packet_type("PEER_LIST_REQ")
+        join_type = protocol_design.get_packet_type("JOIN")
+        join_ack_type = protocol_design.get_packet_type("JOIN_ACK")
+        leave_type = protocol_design.get_packet_type("LEAVE")
+        heartbeat_type = protocol_design.get_packet_type("HEARTBEAT")
+        new_peer_type = protocol_design.get_packet_type("NEW_PEER")
+
+        if packet_type == join_type:
+            protocol_design.check_datagram(message, show_output=False)
+            if peer_id == 0 or not joined_network:
+                return True
+
+            existing_id = next(
+                (
+                    known_id
+                    for known_id, known_addr in peer_snapshot()
+                    if known_addr == addr
+                ),
+                None,
+            )
+            newly_joined = existing_id is None
+            joining_id = existing_id if existing_id is not None else id_generation()
+            if newly_joined:
+                while not add_peer(joining_id, addr):
+                    joining_id = id_generation()
+                last_seen[joining_id] = time.monotonic()
+
+            join_ack(addr, joining_id)
+            if newly_joined:
+                for known_id, known_addr in peer_snapshot():
+                    if known_id == joining_id:
+                        continue
+                    new_peer_datagram = protocol_design.make_datagram(
+                        packet_name="NEW_PEER",
+                        peer_id=peer_id,
+                        destination_p_id=known_id,
+                        protocol_version=protocol_design.PROTOCOL_VERSION,
+                        flags=0,
+                        group_id=0,
+                        seq_no=0,
+                        payload=(joining_id, addr[0], addr[1]),
+                    )
+                    server.sendto(new_peer_datagram, known_addr)
+                send_file_catalog_to_peer(joining_id, addr)
+            return True
+
+        if (
+            packet_type == join_ack_type
+            and not joined_network
+            and bootstrap_addr == addr
+            and destination_id not in (0, 65535)
+        ):
+            peer_records = protocol_design.check_datagram(
+                message,
+                show_output=False,
+            )
+            peer_id = destination_id
+            added_peers = []
+            for known_id, known_ip, known_port in peer_records:
+                known_addr = (known_ip, known_port)
+                if known_id != peer_id and add_peer(known_id, known_addr):
+                    last_seen[known_id] = time.monotonic()
+                    added_peers.append((known_id, known_addr))
+
+            joined_network = True
+            print("Updated peer list:", peer_snapshot())
+            broadcast_file_catalog()
+            rebalance_chunks_for_local_peer()
+            return True
+
+        if destination_id != peer_id:
+            return True
+
+        known_sender = any(
+            known_id == sender_id and known_addr == addr
+            for known_id, known_addr in peer_snapshot()
+        )
+        if packet_type == request_type:
+            if not known_sender:
+                return True
+            protocol_design.check_datagram(message, show_output=False)
+            peer_records = [(peer_id, advertise_ip, local_port)]
+            peer_records.extend(
+                (known_id, known_addr[0], known_addr[1])
+                for known_id, known_addr in peer_snapshot()
+            )
+            response = protocol_design.make_datagram(
+                packet_name="JOIN_ACK",
+                peer_id=peer_id,
+                destination_p_id=sender_id,
+                protocol_version=protocol_design.PROTOCOL_VERSION,
+                flags=0,
+                group_id=0,
+                seq_no=0,
+                payload=peer_records,
+            )
+            server.sendto(response, addr)
+            return True
+
+        if packet_type == heartbeat_type:
+            peer_count, view_hash = protocol_design.check_datagram(
+                message,
+                show_output=False,
+            )
+            if sender_id == 0 or sender_id == peer_id:
+                return True
+            known_addr = dict(peer_snapshot()).get(sender_id)
+            if known_addr is not None and known_addr != addr:
+                return True
+            if known_addr is None:
+                if not add_peer(sender_id, addr):
+                    return True
+                last_seen[sender_id] = time.monotonic()
+                send_file_catalog_to_peer(sender_id, addr)
+                rebalance_chunks_for_local_peer()
+            else:
+                last_seen[sender_id] = time.monotonic()
+
+            local_count, local_hash = peer_view_hash()
+            if (peer_count, view_hash) == (local_count, local_hash):
+                peer_view_mismatch_counts.pop(sender_id, None)
+            else:
+                mismatch_count = peer_view_mismatch_counts.get(sender_id, 0) + 1
+                peer_view_mismatch_counts[sender_id] = mismatch_count
+                if mismatch_count >= 2:
+                    send_peer_list_request(sender_id, addr)
+                    peer_view_mismatch_counts[sender_id] = 0
+            return True
+
+        if not known_sender:
+            return True
+
+        last_seen[sender_id] = time.monotonic()
+        if packet_type == join_ack_type:
+            peer_records = protocol_design.check_datagram(message, show_output=False)
+            added_peers = []
+            for known_id, known_ip, known_port in peer_records:
+                known_addr = (known_ip, known_port)
+                if known_id != peer_id and add_peer(known_id, known_addr):
+                    last_seen[known_id] = time.monotonic()
+                    added_peers.append((known_id, known_addr))
+            for known_id, known_addr in added_peers:
+                send_file_catalog_to_peer(known_id, known_addr)
+            if added_peers:
+                rebalance_chunks_for_local_peer()
+            return True
+
+        if packet_type == new_peer_type:
+            known_id, known_ip, known_port = protocol_design.check_datagram(
+                message,
+                show_output=False,
+            )
+            known_addr = (known_ip, known_port)
+            if known_id != peer_id and add_peer(known_id, known_addr):
+                last_seen[known_id] = time.monotonic()
+                send_file_catalog_to_peer(known_id, known_addr)
+                rebalance_chunks_for_local_peer()
+            return True
+
+        if packet_type == leave_type:
+            protocol_design.check_datagram(message, show_output=False)
+            if remove_peer(sender_id, addr):
+                repair_under_replicated_chunks()
+            return True
+
+        if packet_type == join_type:
+            return True
+        return True
+    except (ValueError, OSError) as error:
+        print(f"Ignoring invalid membership packet from {addr}: {error}")
+        return True
 
 
 def handle_protocol_chat_or_ack(message, addr):
@@ -1274,13 +1941,21 @@ def handle_protocol_chat_or_ack(message, addr):
 
             if destination_id == peer_id and matching_peer is not None:
                 with chat_state_lock:
-                    pending = pending_chats.get(sender_id)
-                    if (
-                        pending is not None
-                        and pending["addr"] == addr
-                        and pending["seq_no"] == ack_no
-                    ):
-                        pending["acknowledged"] = True
+                    pending_by_sequence = pending_chats.get(sender_id)
+                    pending = (
+                        pending_by_sequence.get(ack_no)
+                        if pending_by_sequence is not None
+                        else None
+                    )
+                    if pending is not None and pending["addr"] == addr:
+                        pending_by_sequence.pop(ack_no, None)
+                        if not pending["retransmitted"]:
+                            update_peer_rtt(
+                                sender_id,
+                                time.monotonic() - pending["sent_at"],
+                            )
+                        if not pending_by_sequence:
+                            pending_chats.pop(sender_id, None)
     except (ValueError, UnicodeDecodeError) as error:
         print(f"Ignoring invalid protocol packet from {addr}: {error}")
 
@@ -1297,11 +1972,15 @@ def handle_protocol_catalog(message, addr):
     chunk_have_type = protocol_design.get_packet_type("CHUNK_HAVE")
     chunk_hash_type = protocol_design.get_packet_type("CHUNK_HASH")
     chunk_hash_ack_type = protocol_design.get_packet_type("CHUNK_HASH_ACK")
+    file_list_ack_type = protocol_design.get_packet_type("FILE_LIST_ACK")
+    chunk_have_ack_type = protocol_design.get_packet_type("CHUNK_HAVE_ACK")
     if packet_type not in (
         file_list_type,
         chunk_have_type,
         chunk_hash_type,
         chunk_hash_ack_type,
+        file_list_ack_type,
+        chunk_have_ack_type,
     ):
         return False
 
@@ -1314,7 +1993,13 @@ def handle_protocol_catalog(message, addr):
 
         if packet_type == file_list_type:
             file_records = protocol_design.check_datagram(message, show_output=False)
-        elif packet_type in (chunk_have_type, chunk_hash_ack_type):
+        elif packet_type == file_list_ack_type:
+            file_id = protocol_design.check_datagram(message, show_output=False)
+        elif packet_type in (
+            chunk_have_type,
+            chunk_hash_ack_type,
+            chunk_have_ack_type,
+        ):
             file_id, chunk_index = protocol_design.check_datagram(
                 message, show_output=False
             )
@@ -1344,6 +2029,22 @@ def handle_protocol_catalog(message, addr):
                 hash_state = pending_chunk_hash_acks.get(hash_key)
                 if hash_state is not None and hash_state["addr"] == addr:
                     pending_chunk_hash_acks.pop(hash_key, None)
+            return True
+
+        if packet_type == file_list_ack_type:
+            file_list_key = (sender_id, file_id)
+            with file_list_lock:
+                file_list_state = pending_file_list_acks.get(file_list_key)
+                if file_list_state is not None and file_list_state["addr"] == addr:
+                    pending_file_list_acks.pop(file_list_key, None)
+            return True
+
+        if packet_type == chunk_have_ack_type:
+            chunk_have_key = (sender_id, file_id, chunk_index)
+            with chunk_have_lock:
+                chunk_have_state = pending_chunk_have_acks.get(chunk_have_key)
+                if chunk_have_state is not None and chunk_have_state["addr"] == addr:
+                    pending_chunk_have_acks.pop(chunk_have_key, None)
             return True
 
         if packet_type == file_list_type:
@@ -1390,6 +2091,9 @@ def handle_protocol_catalog(message, addr):
                         ready_replications.append(pending_request)
                         pending_replication_requests.discard(pending_request)
 
+            for file_record in file_records:
+                send_file_list_ack(sender_id, addr, file_record[0])
+
             print(
                 f"Received FILE_LIST from peer {sender_id}: "
                 f"{len(file_records)} file record(s)"
@@ -1419,6 +2123,8 @@ def handle_protocol_catalog(message, addr):
                 else:
                     pending_chunk_have.add((file_id, chunk_index, sender_id))
                     is_new = False
+
+            send_chunk_have_ack(sender_id, addr, file_id, chunk_index)
 
             if is_new:
                 print(
@@ -1518,6 +2224,8 @@ def handle_chunk_transfer(message, addr):
                 protocol_design.check_datagram(message, show_output=False)
             )
             transfer_key = (sender_id, file_id, chunk_index)
+            rtt_sample = None
+            ack_time = time.monotonic()
             with chunk_send_lock:
                 send_state = pending_chunk_sends.get(transfer_key)
                 if send_state is None or send_state["addr"] != addr:
@@ -1534,7 +2242,9 @@ def handle_chunk_transfer(message, addr):
                     return True
 
                 for fragment_offset, _ in send_state["fragments"]:
+                    newly_acked = False
                     if fragment_offset < cumulative_offset:
+                        newly_acked = fragment_offset not in send_state["acked"]
                         send_state["acked"].add(fragment_offset)
                     elif fragment_offset >= cumulative_offset:
                         bit_index, remainder = divmod(
@@ -1546,8 +2256,20 @@ def handle_chunk_transfer(message, addr):
                             and bit_index < CHUNK_SEND_WINDOW
                             and bitmap & (1 << bit_index)
                         ):
+                            newly_acked = fragment_offset not in send_state["acked"]
                             send_state["acked"].add(fragment_offset)
+                    if (
+                        newly_acked
+                        and fragment_offset in send_state["first_sent"]
+                        and fragment_offset not in send_state["retransmitted"]
+                    ):
+                        if rtt_sample is None:
+                            rtt_sample = (
+                                ack_time - send_state["first_sent"][fragment_offset]
+                            )
                 send_state["event"].set()
+            if rtt_sample is not None:
+                update_peer_rtt(sender_id, rtt_sample)
             return True
 
         if packet_type == nak_type:
@@ -1566,6 +2288,7 @@ def handle_chunk_transfer(message, addr):
                     state["error"] = (
                         f"Peer rejected chunk request (reason {reason})"
                     )
+                    state["error_reason"] = reason
                     state["event"].set()
             if reason == protocol_design.CHUNK_NAK_REASONS["HASH_MISMATCH"]:
                 transfer_key = (sender_id, file_id, chunk_index)
@@ -1577,14 +2300,31 @@ def handle_chunk_transfer(message, addr):
             return True
 
         if packet_type == request_type:
-            file_id, chunk_index = protocol_design.check_datagram(
-                message,
-                show_output=False,
+            file_id, chunk_index, start_offset, length = (
+                protocol_design.check_datagram(message, show_output=False)
             )
             if chunk_store.has_chunk(CHUNK_STORE_DIR, file_id, chunk_index):
+                chunk_data = chunk_store.load_chunk(
+                    CHUNK_STORE_DIR,
+                    file_id,
+                    chunk_index,
+                )
+                if (
+                    start_offset % CHUNK_FRAGMENT_DATA_SIZE != 0
+                    or length <= 0
+                    or start_offset + length > len(chunk_data)
+                ):
+                    send_chunk_nak(
+                        sender_id,
+                        addr,
+                        file_id,
+                        chunk_index,
+                        protocol_design.CHUNK_NAK_REASONS["NOT_STORED"],
+                    )
+                    return True
                 threading.Thread(
                     target=send_chunk_data,
-                    args=(sender_id, addr, file_id, chunk_index),
+                    args=(sender_id, addr, file_id, chunk_index, start_offset, length),
                     daemon=True,
                 ).start()
             else:
@@ -1637,6 +2377,8 @@ def handle_chunk_transfer(message, addr):
                 state["error"] = "Conflicting duplicate fragment"
                 state["event"].set()
                 return True
+            if prior_data is None:
+                state["last_progress"] = time.monotonic()
             state["fragments"][fragment_offset] = fragment_data
 
             expected_offset = 0
@@ -1660,6 +2402,7 @@ def handle_chunk_transfer(message, addr):
                 rebuilt_chunk = protocol_design.reassemble_chunk(ordered_fragments)
                 if hashlib.sha256(rebuilt_chunk).digest() != state["expected_hash"]:
                     state["error"] = "Received chunk SHA-256 did not match catalog"
+                    state["error_reason"] = protocol_design.CHUNK_NAK_REASONS["HASH_MISMATCH"]
                     send_chunk_nak(
                         sender_id,
                         addr,
@@ -1700,12 +2443,12 @@ def handle_chunk_transfer(message, addr):
 
 
 def broadcast():
-    global joined_network
-
     while True:
         message, addr = messages.get()
 
         try:
+            if handle_membership_packet(message, addr):
+                continue
             if handle_protocol_chat_or_ack(message, addr):
                 continue
             if handle_chunk_transfer(message, addr):
@@ -1713,75 +2456,10 @@ def broadcast():
             if handle_protocol_catalog(message, addr):
                 continue
 
-            text = message.decode("utf-8")
-            print(text)
-
-            if text.startswith("join:"):
-                joining_id = int(text.split(":", 1)[1])
-
-                if add_peer(joining_id, addr):
-                    last_seen[joining_id] = time.monotonic()
-
-                join_ack(addr, joining_id)
-                send_file_catalog_to_peer(joining_id, addr)
-
-                outgoing = (
-                    f"new_peer:{joining_id},{addr[0]},{addr[1]}"
-                ).encode("utf-8")
-
-                for known_id, known_addr in peer_snapshot():
-                    if known_id != joining_id:
-                        server.sendto(outgoing, known_addr)
-
-            elif text.startswith("join_ack:"):
-                peer_list_text = text.split(":", 1)[1]
-
-                if peer_list_text:
-                    for entry in peer_list_text.split(";"):
-                        known_id_text, known_ip, known_port_text = entry.split(",")
-                        known_id = int(known_id_text)
-                        known_addr = (known_ip, int(known_port_text))
-
-                        if known_id != peer_id and add_peer(
-                            known_id, known_addr
-                        ):
-                            last_seen[known_id] = time.monotonic()
-
-                print("Updated peer list:", peer_snapshot())
-                joined_network = True
-                broadcast_file_catalog()
-                rebalance_chunks_for_local_peer()
-
-            elif text.startswith("new_peer:"):
-                peer_info = text.split(":", 1)[1]
-                known_id_text, known_ip, known_port_text = peer_info.split(",")
-
-                known_id = int(known_id_text)
-                known_addr = (known_ip, int(known_port_text))
-
-                added = known_id != peer_id and add_peer(known_id, known_addr)
-                if added:
-                    last_seen[known_id] = time.monotonic()
-                    send_file_catalog_to_peer(known_id, known_addr)
-
-                print("Updated peer list:", peer_snapshot())
-
-            elif text.startswith("heartbeat:"):
-                sender_id = int(text.split(":", 1)[1])
-
-                for known_id, known_addr in peer_snapshot():
-                    if known_id == sender_id and known_addr == addr:
-                        last_seen[sender_id] = time.monotonic()
-                        break
-
-
-            elif text.startswith("leave:"):
-                leaving_id=int(text.split(":", 1)[1])
-                if remove_peer(leaving_id, addr):
-                    last_seen.pop(leaving_id, None)
-                    repair_under_replicated_chunks()
-
-                print("Updated peer list:", peer_snapshot())
+            try:
+                print(message.decode("utf-8"))
+            except UnicodeDecodeError:
+                print(f"Ignoring unrecognized binary message from {addr}")
 
         except UnicodeDecodeError:
             print(f"Ignoring invalid message from {addr}")
@@ -1853,11 +2531,18 @@ def main():
     advertise_ip = "127.0.0.1"
 
     server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.setsockopt(
+        socket.SOL_SOCKET,
+        socket.SO_RCVBUF,
+        SOCKET_RECEIVE_BUFFER_SIZE,
+    )
     server.bind(("0.0.0.0", local_port))
 
-    test_peer_helpers()
+    peer_id = 0 if bootstrap_addr is not None else id_generation()
+    if bootstrap_addr is None:
+        joined_network = True
 
-    peer_id = id_generation()
+    test_peer_helpers()
 
 
     threading.Thread(target=receive, daemon=True).start()
@@ -1866,6 +2551,8 @@ def main():
     threading.Thread(target=chat_sender, daemon=True).start()
     threading.Thread(target=chat_input, daemon=True).start()
     threading.Thread(target=retry_chunk_hashes, daemon=True).start()
+    threading.Thread(target=retry_file_lists, daemon=True).start()
+    threading.Thread(target=retry_chunk_have, daemon=True).start()
 
     if bootstrap_addr is not None:
         join(peer_id, bootstrap_addr)
