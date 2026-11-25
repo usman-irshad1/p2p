@@ -4,7 +4,7 @@ A student project to build a multi-peer group chat and file-sharing application 
 
 ## Project status
 
-**Status:** The supplied unit suite passed (17 tests) on 25 Nov 2026. The latest expanded localhost integration run passed the four-peer chat, membership, initial replication, multi-source download, corruption fallback, and simulated source-failure checks, but failed during late-join rebalancing: the fifth peer did not receive every chunk assigned to it. LAN interoperability and broader packet-loss simulation remain unverified.
+**Status:** The supplied unit suite passed (17 tests), and the expanded localhost integration run passed on 25 Nov 2026. The run verified four-peer chat and membership, five-peer late-join rebalancing, replicated file placement, multi-source download, corruption fallback, and recovery after a source crash. The late-join transfer now retries with a refreshed owner list. Real LAN interoperability and broader packet-loss simulation remain unverified.
 
 ### Progress against `protocol_improvements.pdf`
 
@@ -16,7 +16,7 @@ A student project to build a multi-peer group chat and file-sharing application 
 4. [x] Ranged `CHUNK_REQUEST` with resume offsets, `CHUNK_NAK` failover, and per-chunk SHA-256 metadata/checking (`CHUNK_HASH`).
 5. [x] Bootstrap ID assignment, heartbeat membership-view hashes and repair, and bounded HRW placement across at least three peers.
 
-These items are present in the current code. The latest integration run did not verify every behavior end to end; see the checklist below for the late-join failure and remaining assignment checks.
+These items are present in the current code. The localhost integration run verifies the main flows described below; LAN interoperability and broader packet-loss tests remain outstanding.
 
 ### Implemented or prototyped
 
@@ -57,16 +57,16 @@ These items are present in the current code. The latest integration run did not 
 
 ### Remaining for the full assignment
 
-- [ ] Simulate network packet loss and verify FILE_LIST, CHUNK_HASH, CHUNK_HAVE retries and selective fragment retransmission; save screenshots.
-- [ ] Corrupt a stored chunk/digest and verify hash rejection and fallback to a replica; save screenshots.
-- [ ] Saturate a source's four transfer slots and verify BUSY response plus alternate-owner failover; save screenshots.
+- [ ] Simulate packet loss across FILE_LIST, CHUNK_HASH, and CHUNK_HAVE retries; the integration test deliberately drops one CHUNK_DATA fragment and verifies retransmission.
+- [x] Corrupt a stored chunk and verify hash rejection and fallback to a valid replica in the localhost integration run.
+- [x] Exercise a simulated BUSY response during replication in the localhost integration run; saturation of all four real transfer slots still needs a separate test.
 - [x] Four-peer localhost checks passed for membership, chat, two 2.5 MB files, replica count, and no complete-file owner.
-- [ ] The expanded integration run fails at the fifth-peer late-join check: the joiner does not receive every chunk assigned in the new placement. Logs include `Could not rebalance chunk ... No peer delivered ...`.
-- [ ] Index at least two 2 MB-or-larger files from each participant (the included test indexes two files total).
+- [x] Fifth-peer late join passed: the new peer received every chunk assigned to it under the updated placement.
+- [x] The integration run indexed two 2.5 MB files from each of five peers.
 - [x] Integration run downloaded a file from multiple source peers and checked its SHA-256.
 - [x] Integration run stopped a source during a download, verified failover and full-file SHA-256, then observed timeout removal and re-replication.
 - [ ] Run the complete demo across four actual participant machines and verify LAN addresses/firewall behavior.
-- [x] Add the latest integration screenshots and captions to [the debugging PDF](evidence/p2p_debug_outputs.pdf), including the late-join rebalance failure and peer logs.
+- [x] Add the latest successful integration screenshots to [the debugging PDF](evidence/p2p_debug_outputs.pdf), pages 34-37. Earlier failure screenshots remain as troubleshooting history.
 - [ ] Record performance measurements and graphs for the report.
 - [ ] Finish submission packaging, run instructions, and live demonstration preparation.
 
@@ -98,9 +98,9 @@ From the project directory, run:
 python integration_test.py
 ```
 
-The checker runs the unit suite, starts four localhost peers, indexes two 2.5 MB files from each, and exercises a lost CHUNK_DATA fragment, BUSY reply, corrupted replica, and source crash during download. In the latest run, the four-peer checks passed, including overlapping multi-source download, reconstruction, timeout removal, and replica repair. The later fifth-peer join/rebalance check failed because the joiner did not receive every chunk assigned to it; fix this before treating the full integration run as passing.
+The checker runs the unit suite, starts four localhost peers, indexes two 2.5 MB files from each, then adds a fifth peer and indexes two files from it. It exercises a lost CHUNK_DATA fragment, BUSY reply, corrupted replica, and source crash during download. The latest run passed the four-peer and late-join checks, including overlapping multi-source download, reconstruction, timeout removal, and replica repair.
 
-Temporary test stores and files are removed when the checker exits. It chooses free consecutive UDP ports unless `P2P_TEST_PORT` is set. The run prints localhost timing measurements and saves them to `output/integration_metrics.csv`. The latest run failed during late-join rebalancing, so its output is diagnostic evidence rather than a complete pass. It does not verify real LAN/firewall behavior or simulate packet loss for every packet type.
+Temporary test stores and files are removed when the checker exits. It chooses free consecutive UDP ports unless `P2P_TEST_PORT` is set. The run prints localhost timing measurements and saves them to `output/integration_metrics.csv`. The latest run passed; its timings are local demonstrations, not benchmarks. It does not verify real LAN/firewall behavior or simulate packet loss for every packet type.
 
 In a peer terminal, share a file and inspect the catalog:
 
@@ -165,7 +165,7 @@ sequenceDiagram
     Note over S,R: If the ACK times out, sender retries the unchanged CHAT
 ```
 
-The supplied unit suite checks Rule 6/7 cases, and the four-peer run verified chat delivery without repeated display. The latest run screenshots are included in the evidence PDF; the full integration run remains blocked by the late-join rebalance failure described above.
+The supplied unit suite checks Rule 6/7 cases, and the integration run verified chat delivery without repeated display across the four initial peers and the later joiner. Screenshots of the 17 passing unit tests and successful five-peer integration run are included on pages 34-37 of the evidence PDF.
 
 ### File placement and basic download
 
@@ -206,8 +206,7 @@ Measured performance graphs still need real test data. Planned graphs include ch
 ## Current limitations
 
 - The integration test covers localhost UDP only. Packet-loss simulation, simultaneous joins, peer-list overflow and real multi-machine LAN behavior still need testing.
-- Assignment-scale indexing from every participant is not covered by the included test; it indexes two files total.
-- Corrupt-chunk rejection has unit/code coverage but has not been demonstrated with an intentionally corrupted live source.
+- The integration test indexes two 2.5 MB files from each of five localhost peers and demonstrates live corrupt-chunk rejection and replica fallback. Larger groups and separate machines still need testing.
 - Join-time rebalancing retains older replicas. Safe deletion of surplus copies is not implemented.
 - Peer lists, transfer queues, and catalog state are in memory and are rebuilt through peer exchange after restart.
 - Performance measurements and graphs are still needed for the report.
