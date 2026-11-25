@@ -50,6 +50,18 @@ def check_datagram(datagram, show_output=True):
     packet_type = decoded_fields[2]
     payload = datagram[header_size:]
 
+    if packet_type in (0, 3, 4, 6, 11, 18):
+        if decoded_fields[6] != 0 or decoded_fields[7] != 0:
+            raise ValueError("Membership packets require zero sequence fields")
+    if packet_type == 0 and (decoded_fields[0] != 0 or decoded_fields[1] != 0):
+        raise ValueError("JOIN must use source ID 0 and destination ID 0")
+    if packet_type == 6 and (decoded_fields[0] == 0 or decoded_fields[1] in (0, 65535)):
+        raise ValueError("JOIN_ACK must name its bootstrap and assigned destination IDs")
+    if packet_type in (3, 4, 11, 18) and (
+        decoded_fields[0] == 0 or decoded_fields[1] in (0, 65535)
+    ):
+        raise ValueError("Membership packet must name active peer IDs")
+
     if packet_type == 5:
         if actual_payload_length != 0 or decoded_fields[8] != 0:
             raise ValueError("ACK payload must be empty")
@@ -81,6 +93,18 @@ def check_datagram(datagram, show_output=True):
         if decoded_fields[6] != 0 or decoded_fields[7] != 0:
             raise ValueError("CHUNK_HASH_ACK requires zero header sequence fields")
 
+    if packet_type == 16:
+        if decoded_fields[6] != 0 or decoded_fields[7] != 0:
+            raise ValueError("FILE_LIST_ACK requires zero header sequence fields")
+
+    if packet_type == 17:
+        if decoded_fields[6] != 0 or decoded_fields[7] != 0:
+            raise ValueError("CHUNK_HAVE_ACK requires zero header sequence fields")
+
+    if packet_type == 18:
+        if decoded_fields[6] != 0 or decoded_fields[7] != 0:
+            raise ValueError("PEER_LIST_REQ requires zero header sequence fields")
+
     if compute_checksum(datagram) != decoded_fields[9]:
         raise ValueError("Checksum mismatch")
 
@@ -100,19 +124,23 @@ def check_datagram(datagram, show_output=True):
 
             known_id, ip_bytes, port = struct.unpack("!H4sH", payload)
             ip = socket.inet_ntoa(ip_bytes)
-            print("New peer:", known_id, ip, port)
+            if show_output:
+                print("New peer:", known_id, ip, port)
             return known_id, ip, port
 
         elif packet_type == 2:
-            if len(payload) != 36:
-                raise ValueError("CHUNK_REQUEST payload must be exactly 36 bytes")
+            if len(payload) != 44:
+                raise ValueError("CHUNK_REQUEST payload must be exactly 44 bytes")
 
-            file_id = payload[:32]
-            chunk_index = struct.unpack("!I", payload[32:])[0]
+            file_id, chunk_index, start_offset, length = struct.unpack(
+                "!32sIII", payload
+            )
             if show_output:
                 print("file_id:", file_id.hex())
                 print("chunk_index:", chunk_index)
-            return file_id, chunk_index
+                print("start_offset:", start_offset)
+                print("length:", length)
+            return file_id, chunk_index, start_offset, length
 
         elif packet_type == 9:  # CHUNK_HAVE
             if len(payload) != 36:
@@ -125,8 +153,16 @@ def check_datagram(datagram, show_output=True):
                 print("chunk_index:", chunk_index)
             return file_id, chunk_index
 
-        elif packet_type == 0 or packet_type == 3 or packet_type == 4:
-            print("No payload")
+        elif packet_type in (0, 3):  # JOIN and LEAVE
+            if payload:
+                raise ValueError("JOIN and LEAVE payloads must be empty")
+            return None
+
+        elif packet_type == 4:  # HEARTBEAT
+            if len(payload) != 6:
+                raise ValueError("HEARTBEAT payload must be exactly 6 bytes")
+            peer_count, view_hash = struct.unpack("!HI", payload)
+            return peer_count, view_hash
 
         elif packet_type == 5:
             ack_sequence_number = decoded_fields[7]
@@ -159,8 +195,9 @@ def check_datagram(datagram, show_output=True):
                 peers_in_ack.append((known_id, ip, port))
 
             if show_output:
-                print("Acknowledged JOIN sequence:", decoded_fields[7])
+                print("Assigned peer ID:", decoded_fields[1])
                 print("Peers in JOIN_ACK:", peers_in_ack)
+            return peers_in_ack
 
         elif packet_type == 7:  # CHUNK_DATA
             if len(datagram) > MAX_DATAGRAM_SIZE:
@@ -295,6 +332,22 @@ def check_datagram(datagram, show_output=True):
             file_id, chunk_index = struct.unpack("!32sI", payload)
             return file_id, chunk_index
 
+        elif packet_type == 16:  # FILE_LIST_ACK
+            if len(payload) != 32:
+                raise ValueError("FILE_LIST_ACK payload must be exactly 32 bytes")
+            return payload
+
+        elif packet_type == 17:  # CHUNK_HAVE_ACK
+            if len(payload) != 36:
+                raise ValueError("CHUNK_HAVE_ACK payload must be exactly 36 bytes")
+            file_id, chunk_index = struct.unpack("!32sI", payload)
+            return file_id, chunk_index
+
+        elif packet_type == 18:  # PEER_LIST_REQ
+            if payload:
+                raise ValueError("PEER_LIST_REQ payload must be empty")
+            return None
+
 
 
     else:
@@ -359,6 +412,12 @@ def get_packet_type(packet_name):
         return 14
     elif packet_name == "CHUNK_HASH_ACK":
         return 15
+    elif packet_name == "FILE_LIST_ACK":
+        return 16
+    elif packet_name == "CHUNK_HAVE_ACK":
+        return 17
+    elif packet_name == "PEER_LIST_REQ":
+        return 18
     else:
         raise ValueError("Unknown packet type")
 
@@ -414,20 +473,31 @@ def decode_chat_payload(payload):
 
 
 def make_payload(payload, packet_type):
-    if packet_type == 0 or packet_type == 3 or packet_type == 4:
+    if packet_type in (0, 3, 18):
         return b""
+
+    elif packet_type == 4:  # HEARTBEAT
+        peer_count, view_hash = payload
+        if not 0 <= peer_count <= 0xFFFF:
+            raise ValueError("HEARTBEAT peer_count must fit in 16 bits")
+        if not 0 <= view_hash <= 0xFFFFFFFF:
+            raise ValueError("HEARTBEAT view_hash must fit in 32 bits")
+        return struct.pack("!HI", peer_count, view_hash)
 
     elif packet_type == 1:
         chat_sequence, text = payload
         return make_chat_payload(chat_sequence, text)
 
     elif packet_type == 2:
-        file_id, chunk_index = payload
+        file_id, chunk_index, start_offset, length = payload
 
         if len(file_id) != 32:
             raise ValueError("file_id must be a 32-byte SHA-256 hash")
 
-        return file_id + struct.pack("!I", chunk_index)
+        if start_offset < 0 or length <= 0:
+            raise ValueError("CHUNK_REQUEST range must have a nonnegative offset and positive length")
+
+        return struct.pack("!32sIII", file_id, chunk_index, start_offset, length)
 
     elif packet_type == 5:  # ACK
         return b""
@@ -568,6 +638,18 @@ def make_payload(payload, packet_type):
             raise ValueError("file_id must be a 32-byte SHA-256 hash")
         return file_id + struct.pack("!I", chunk_index)
 
+    elif packet_type == 16:  # FILE_LIST_ACK
+        file_id = payload
+        if not isinstance(file_id, bytes) or len(file_id) != 32:
+            raise ValueError("file_id must be a 32-byte SHA-256 hash")
+        return file_id
+
+    elif packet_type == 17:  # CHUNK_HAVE_ACK
+        file_id, chunk_index = payload
+        if not isinstance(file_id, bytes) or len(file_id) != 32:
+            raise ValueError("file_id must be a 32-byte SHA-256 hash")
+        return file_id + struct.pack("!I", chunk_index)
+
     else:
         raise NotImplementedError(
             "Payload format not added for this packet type"
@@ -591,6 +673,9 @@ def make_datagram(
     if packet_type == 1 and not 1 <= seq_no <= 0xFFFF:
         raise ValueError("CHAT seq_no must be between 1 and 65535")
 
+    if packet_type in (0, 3, 4, 6, 11, 18) and (seq_no != 0 or ack_no != 0):
+        raise ValueError("Membership packets require seq_no=0 and ack_no=0")
+
     if packet_type == 5:
         if seq_no != 0:
             raise ValueError("ACK seq_no must be zero")
@@ -611,6 +696,15 @@ def make_datagram(
 
     if packet_type == 15 and (seq_no != 0 or ack_no != 0):
         raise ValueError("CHUNK_HASH_ACK requires seq_no=0 and ack_no=0")
+
+    if packet_type == 16 and (seq_no != 0 or ack_no != 0):
+        raise ValueError("FILE_LIST_ACK requires seq_no=0 and ack_no=0")
+
+    if packet_type == 17 and (seq_no != 0 or ack_no != 0):
+        raise ValueError("CHUNK_HAVE_ACK requires seq_no=0 and ack_no=0")
+
+    if packet_type == 18 and (seq_no != 0 or ack_no != 0):
+        raise ValueError("PEER_LIST_REQ requires seq_no=0 and ack_no=0")
 
     payload_encoded = make_payload(payload, packet_type)
     datagram = None
@@ -712,9 +806,6 @@ def make_datagram(
         datagram = header_bytes
 
     if packet_type == 6:  # JOIN_ACK
-        if ack_no is None:
-            raise ValueError("JOIN_ACK requires the JOIN sequence number")
-
         fields = (
             peer_id,
             destination_p_id,
@@ -874,6 +965,54 @@ def make_datagram(
         header_bytes = struct.pack(HEADER_FORMAT, *fields)
         datagram = header_bytes + payload_encoded
 
+    if packet_type == 16:  # FILE_LIST_ACK
+        fields = (
+            peer_id,
+            destination_p_id,
+            packet_type,
+            protocol_version,
+            flags,
+            group_id,
+            seq_no,
+            ack_no,
+            len(payload_encoded),
+            0,
+        )
+        header_bytes = struct.pack(HEADER_FORMAT, *fields)
+        datagram = header_bytes + payload_encoded
+
+    if packet_type == 17:  # CHUNK_HAVE_ACK
+        fields = (
+            peer_id,
+            destination_p_id,
+            packet_type,
+            protocol_version,
+            flags,
+            group_id,
+            seq_no,
+            ack_no,
+            len(payload_encoded),
+            0,
+        )
+        header_bytes = struct.pack(HEADER_FORMAT, *fields)
+        datagram = header_bytes + payload_encoded
+
+    if packet_type == 18:  # PEER_LIST_REQ
+        fields = (
+            peer_id,
+            destination_p_id,
+            packet_type,
+            protocol_version,
+            flags,
+            group_id,
+            seq_no,
+            ack_no,
+            len(payload_encoded),
+            0,
+        )
+        header_bytes = struct.pack(HEADER_FORMAT, *fields)
+        datagram = header_bytes
+
     # Compute the checksum over the whole datagram and write it into the header.
     value = compute_checksum(datagram)
 
@@ -967,8 +1106,8 @@ def main():
         protocol_version=1,
         flags=0,
         group_id=0,
-        seq_no=2,
-        ack_no=7,
+        seq_no=0,
+        ack_no=0,
         payload=peer_list,
     )
 
@@ -983,7 +1122,9 @@ def main():
     peer_count = struct.unpack("!H", join_ack_payload[:2])[0]
 
     assert join_ack_fields[2] == 6
-    assert join_ack_fields[7] == 7
+    assert join_ack_fields[1] == 1004
+    assert join_ack_fields[6] == 0
+    assert join_ack_fields[7] == 0
     assert peer_count == 2
     assert join_ack_fields[8] == 2 + (2 * 8)
 
@@ -997,7 +1138,7 @@ def main():
         protocol_version=1,
         flags=0,
         group_id=0,
-        seq_no=3,
+        seq_no=0,
         ack_no=0,
         payload=new_peer_info,
     )
