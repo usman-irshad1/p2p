@@ -72,6 +72,7 @@ Packet type numbers currently assigned in `protocol_design.py`:
 | 12 | CHUNK_NAK | 32-byte file ID + `uint32 chunk_index` + `uint8 reason` | Live handler sends NOT_STORED or HASH_MISMATCH; requester advances to another owner. |
 | 13 | CHUNK_ACK | 32-byte file ID + `uint32 chunk_index` + `uint32 cumulative_offset` + `uint32 bitmap` | Live handler acknowledges received fragments and supports selective retransmission in 32-fragment windows. |
 | 14 | CHUNK_HASH | 32-byte file ID + `uint32 chunk_index` + 32-byte SHA-256 digest | Live catalog exchange distributes each chunk's expected digest; receivers verify before storing. |
+| 15 | CHUNK_HASH_ACK | 32-byte file ID + `uint32 chunk_index` | Acknowledges receipt of the matching CHUNK_HASH; sender retries the same datagram when this ACK is missing. |
 
 The registry is not complete until every type has a precise purpose, payload layout, and message flow, or is explicitly marked reserved for a later version.
 
@@ -176,6 +177,17 @@ uint32 chunk_index
 
 The payload is exactly 68 bytes; header `seq_no` and `ack_no` are zero. Peers send one CHUNK_HASH for each cataloged chunk after FILE_LIST metadata. A receiver may retain a hash that arrives before FILE_LIST and apply it when file metadata arrives. Downloads and replication wait until the expected hash is known. After reassembly, the receiver compares SHA-256 of the chunk bytes with this digest before storing the chunk and announcing CHUNK_HAVE. On mismatch it sends CHUNK_NAK with reason HASH_MISMATCH and does not store the chunk.
 
+### CHUNK_HASH_ACK (type 15) - digest receipt acknowledgment
+
+Payload:
+
+```text
+32-byte file_id
+uint32 chunk_index
+```
+
+The payload is exactly 36 bytes; header `seq_no` and `ack_no` are zero. The receiver sends this ACK after accepting a CHUNK_HASH, including when it receives a duplicate. The sender keeps the original CHUNK_HASH datagram and retries it after one second when no matching ACK arrives, for up to five retries. It clears pending retry state when the ACK matches the sender, file ID, chunk index, and peer address, or when that peer is removed. After the retry limit, it drops the pending state; delivery is not guaranteed beyond that point. CHUNK_HASH_ACK is not itself acknowledged.
+
 ### NEW_PEER (type 11) - proposed
 
 Proposed payload: one peer record, using the same 8-byte record as JOIN_ACK:
@@ -258,15 +270,15 @@ After a graceful LEAVE or heartbeat timeout, each peer removes the departed owne
 
 When a peer joins, it uses the current peer IDs and balanced placement algorithm to find chunks assigned to it. Existing owners send `FILE_LIST`, `CHUNK_HASH`, and `CHUNK_HAVE`; the joining peer waits for each expected digest, requests its missing assigned chunks with `CHUNK_REQUEST`, verifies and stores the data, and announces ownership with `CHUNK_HAVE`.
 
-Limitations: initial placement runs only when `/index` is issued and needs four peers and at least two chunks. Join rebalancing adds the joining peer's assigned copies but does not delete older replicas, so extra copies can remain. Automatic repair and join rebalancing are implemented but still need live multi-peer verification. CHUNK_ACK/CHUNK_NAK and per-chunk CHUNK_HASH handling are connected, but loss recovery, hash mismatch handling, and failover still need live verification; BUSY NAK and safe removal of surplus replicas are not implemented.
+Limitations: initial placement runs only when `/index` is issued and needs four peers and at least two chunks. Join rebalancing adds the joining peer's assigned copies but does not delete older replicas, so extra copies can remain. Automatic repair and join rebalancing are implemented but still need live multi-peer verification. CHUNK_ACK/CHUNK_NAK and CHUNK_HASH/CHUNK_HASH_ACK handling are connected, but packet-loss recovery, hash mismatch handling, and failover still need live verification; BUSY NAK and safe removal of surplus replicas are not implemented.
 
 ## 7. Current implementation inventory
 
 ### Implemented or prototyped
 
-- 20-byte binary header format and packet type mapping through type 14.
-- Payload encoders/parsers for CHAT, CHUNK_REQUEST, ACK, JOIN_ACK, CHUNK_DATA, FILE_LIST, CHUNK_HAVE, REPLICATE_REQ, CHUNK_ACK, CHUNK_NAK, and CHUNK_HASH.
-- FILE_LIST catalog exchange with per-chunk SHA-256 digest records. CHUNK_HASH datagrams themselves are not retransmitted or acknowledged yet; a missing digest prevents that chunk from being downloaded until catalog information is received.
+- 20-byte binary header format and packet type mapping through type 15.
+- Payload encoders/parsers for CHAT, CHUNK_REQUEST, ACK, JOIN_ACK, CHUNK_DATA, FILE_LIST, CHUNK_HAVE, REPLICATE_REQ, CHUNK_ACK, CHUNK_NAK, CHUNK_HASH, and CHUNK_HASH_ACK.
+- FILE_LIST catalog exchange with per-chunk SHA-256 digest records. CHUNK_HASH is acknowledged and retried up to five times when its matching CHUNK_HASH_ACK is not received; this recovery path still needs live packet-loss verification.
 - File SHA-256 helper and a local two-fragment CHUNK_DATA reassembly demonstration.
 - In-memory FILE_LIST/CHUNK_HAVE catalog exchange, REPLICATE_REQ placement, and on-disk chunk store.
 - Basic live CHUNK_REQUEST/CHUNK_DATA transfer, parallel batches of four download chunks, request retries, and whole-file SHA-256 verification.

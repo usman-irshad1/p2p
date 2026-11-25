@@ -23,11 +23,13 @@ chat_state_lock = threading.Lock()
 file_catalog_lock = threading.RLock()
 chunk_download_lock = threading.Lock()
 chunk_send_lock = threading.Lock()
+chunk_hash_lock = threading.Lock()
 outgoing_chat_queues = {}
 pending_chats = {}
 file_catalog_state = file_catalog_helpers.create_catalog()
 pending_chunk_have = set()
 pending_chunk_hashes = {}
+pending_chunk_hash_acks = {}
 pending_chunk_downloads = {}
 pending_chunk_sends = {}
 pending_replication_requests = set()
@@ -56,6 +58,8 @@ CHUNK_REQUEST_TIMEOUT = 5
 CHUNK_ACK_TIMEOUT = 0.75
 CHUNK_FRAGMENT_RETRIES = 5
 CHUNK_SEND_WINDOW = 32
+CHUNK_HASH_ACK_TIMEOUT = 1
+CHUNK_HASH_RETRIES = 5
 CHUNK_REPAIR_RETRY_INTERVAL = CHUNK_REQUEST_TIMEOUT * 2
 MIN_DISTRIBUTION_PEERS = 4
 MAX_FILE_LIST_FILENAME_BYTES = (
@@ -110,6 +114,10 @@ def remove_peer(peer_id, peer_addr=None):
             ):
                 if target_id == peer_id:
                     pending_chunk_repairs.pop(repair_key, None)
+        with chunk_hash_lock:
+            for hash_key in tuple(pending_chunk_hash_acks):
+                if hash_key[0] == peer_id:
+                    pending_chunk_hash_acks.pop(hash_key, None)
 
     return removed
 
@@ -255,17 +263,7 @@ def send_file_catalog_to_peer(destination_id, destination_addr):
         server.sendto(datagram, destination_addr)
 
     for file_id, chunk_index, chunk_hash in chunk_hashes:
-        datagram = protocol_design.make_datagram(
-            packet_name="CHUNK_HASH",
-            peer_id=peer_id,
-            destination_p_id=destination_id,
-            protocol_version=protocol_design.PROTOCOL_VERSION,
-            flags=0,
-            group_id=0,
-            seq_no=0,
-            payload=(file_id, chunk_index, chunk_hash),
-        )
-        server.sendto(datagram, destination_addr)
+        send_chunk_hash(destination_id, destination_addr, file_id, chunk_index, chunk_hash)
 
     for file_id, chunk_index in local_chunks:
         datagram = protocol_design.make_datagram(
@@ -611,6 +609,70 @@ def send_chunk_nak(destination_id, destination_addr, file_id, chunk_index, reaso
         payload=(file_id, chunk_index, reason),
     )
     server.sendto(datagram, destination_addr)
+
+
+def send_chunk_hash(destination_id, destination_addr, file_id, chunk_index, chunk_hash):
+    """Send one expected digest and retain it until the receiver acknowledges."""
+    datagram = protocol_design.make_datagram(
+        packet_name="CHUNK_HASH",
+        peer_id=peer_id,
+        destination_p_id=destination_id,
+        protocol_version=protocol_design.PROTOCOL_VERSION,
+        flags=0,
+        group_id=0,
+        seq_no=0,
+        payload=(file_id, chunk_index, chunk_hash),
+    )
+    key = (destination_id, file_id, chunk_index)
+    with chunk_hash_lock:
+        pending_chunk_hash_acks[key] = {
+            "addr": destination_addr,
+            "datagram": datagram,
+            "last_sent": time.monotonic(),
+            "retries": 0,
+        }
+    server.sendto(datagram, destination_addr)
+
+
+def send_chunk_hash_ack(destination_id, destination_addr, file_id, chunk_index):
+    """Acknowledge a received digest, including a duplicate CHUNK_HASH."""
+    datagram = protocol_design.make_datagram(
+        packet_name="CHUNK_HASH_ACK",
+        peer_id=peer_id,
+        destination_p_id=destination_id,
+        protocol_version=protocol_design.PROTOCOL_VERSION,
+        flags=0,
+        group_id=0,
+        seq_no=0,
+        payload=(file_id, chunk_index),
+    )
+    server.sendto(datagram, destination_addr)
+
+
+def retry_chunk_hashes():
+    """Retry unacknowledged chunk hashes five times, then drop pending state."""
+    while True:
+        now = time.monotonic()
+        due_datagrams = []
+        with chunk_hash_lock:
+            for key, state in tuple(pending_chunk_hash_acks.items()):
+                if now - state["last_sent"] < CHUNK_HASH_ACK_TIMEOUT:
+                    continue
+                if state["retries"] >= CHUNK_HASH_RETRIES:
+                    pending_chunk_hash_acks.pop(key, None)
+                    continue
+
+                state["retries"] += 1
+                state["last_sent"] = now
+                due_datagrams.append((state["datagram"], state["addr"]))
+
+        for datagram, destination_addr in due_datagrams:
+            try:
+                server.sendto(datagram, destination_addr)
+            except OSError:
+                pass
+
+        time.sleep(CHUNK_HASH_ACK_TIMEOUT / 2)
 
 
 def send_chunk_data(destination_id, destination_addr, file_id, chunk_index):
@@ -1226,7 +1288,7 @@ def handle_protocol_chat_or_ack(message, addr):
 
 
 def handle_protocol_catalog(message, addr):
-    """Process FILE_LIST, CHUNK_HASH, and CHUNK_HAVE catalog messages."""
+    """Process FILE_LIST, chunk hashes, and chunk ownership catalog messages."""
     if len(message) < protocol_design.header_size:
         return False
 
@@ -1234,7 +1296,13 @@ def handle_protocol_catalog(message, addr):
     file_list_type = protocol_design.get_packet_type("FILE_LIST")
     chunk_have_type = protocol_design.get_packet_type("CHUNK_HAVE")
     chunk_hash_type = protocol_design.get_packet_type("CHUNK_HASH")
-    if packet_type not in (file_list_type, chunk_have_type, chunk_hash_type):
+    chunk_hash_ack_type = protocol_design.get_packet_type("CHUNK_HASH_ACK")
+    if packet_type not in (
+        file_list_type,
+        chunk_have_type,
+        chunk_hash_type,
+        chunk_hash_ack_type,
+    ):
         return False
 
     try:
@@ -1246,7 +1314,7 @@ def handle_protocol_catalog(message, addr):
 
         if packet_type == file_list_type:
             file_records = protocol_design.check_datagram(message, show_output=False)
-        elif packet_type == chunk_have_type:
+        elif packet_type in (chunk_have_type, chunk_hash_ack_type):
             file_id, chunk_index = protocol_design.check_datagram(
                 message, show_output=False
             )
@@ -1268,6 +1336,14 @@ def handle_protocol_catalog(message, addr):
             last_seen[sender_id] = time.monotonic()
             known_sender = True
         if not known_sender:
+            return True
+
+        if packet_type == chunk_hash_ack_type:
+            hash_key = (sender_id, file_id, chunk_index)
+            with chunk_hash_lock:
+                hash_state = pending_chunk_hash_acks.get(hash_key)
+                if hash_state is not None and hash_state["addr"] == addr:
+                    pending_chunk_hash_acks.pop(hash_key, None)
             return True
 
         if packet_type == file_list_type:
@@ -1379,6 +1455,7 @@ def handle_protocol_catalog(message, addr):
                     owner_id,
                     owner_addr,
                 )
+            send_chunk_hash_ack(sender_id, addr, file_id, chunk_index)
             rebalance_chunks_for_local_peer()
 
     except (ValueError, UnicodeDecodeError, KeyError) as error:
@@ -1788,6 +1865,7 @@ def main():
     threading.Thread(target=heartbeat, daemon=True).start()
     threading.Thread(target=chat_sender, daemon=True).start()
     threading.Thread(target=chat_input, daemon=True).start()
+    threading.Thread(target=retry_chunk_hashes, daemon=True).start()
 
     if bootstrap_addr is not None:
         join(peer_id, bootstrap_addr)
