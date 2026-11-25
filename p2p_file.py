@@ -21,11 +21,13 @@ sequence_lock = threading.Lock()
 chat_state_lock = threading.Lock()
 file_catalog_lock = threading.RLock()
 chunk_download_lock = threading.Lock()
+chunk_send_lock = threading.Lock()
 outgoing_chat_queues = {}
 pending_chats = {}
 file_catalog_state = file_catalog_helpers.create_catalog()
 pending_chunk_have = set()
 pending_chunk_downloads = {}
+pending_chunk_sends = {}
 pending_replication_requests = set()
 active_replication_tasks = set()
 chunk_placement_state = {}
@@ -49,6 +51,9 @@ CHUNK_FRAGMENT_DATA_SIZE = (
     protocol_design.MAX_DATAGRAM_SIZE - protocol_design.header_size - 44
 )
 CHUNK_REQUEST_TIMEOUT = 5
+CHUNK_ACK_TIMEOUT = 0.75
+CHUNK_FRAGMENT_RETRIES = 5
+CHUNK_SEND_WINDOW = 32
 CHUNK_REPAIR_RETRY_INTERVAL = CHUNK_REQUEST_TIMEOUT * 2
 MIN_DISTRIBUTION_PEERS = 4
 MAX_FILE_LIST_FILENAME_BYTES = (
@@ -531,15 +536,59 @@ def register_file_metadata(file_path):
     return file_id, metadata, len(chunk_indices), requests_sent
 
 
-def send_chunk_data(destination_id, destination_addr, file_id, chunk_index):
-    """Send one locally stored chunk as protocol-sized CHUNK_DATA fragments."""
-    chunk_data = chunk_store.load_chunk(
-        CHUNK_STORE_DIR,
-        file_id,
-        chunk_index,
-    )
-    total_chunk_size = len(chunk_data)
+def send_chunk_ack(destination_id, destination_addr, file_id, chunk_index, fragments):
+    """Acknowledge received fragments with a cumulative offset and 32-bit bitmap."""
+    received_offsets = set(fragments)
+    cumulative_offset = 0
+    while cumulative_offset in received_offsets:
+        cumulative_offset += len(fragments[cumulative_offset])
 
+    bitmap = 0
+    for bit_index in range(CHUNK_SEND_WINDOW):
+        fragment_offset = cumulative_offset + bit_index * CHUNK_FRAGMENT_DATA_SIZE
+        if fragment_offset in received_offsets:
+            bitmap |= 1 << bit_index
+
+    datagram = protocol_design.make_datagram(
+        packet_name="CHUNK_ACK",
+        peer_id=peer_id,
+        destination_p_id=destination_id,
+        protocol_version=protocol_design.PROTOCOL_VERSION,
+        flags=0,
+        group_id=0,
+        seq_no=0,
+        payload=(file_id, chunk_index, cumulative_offset, bitmap),
+    )
+    server.sendto(datagram, destination_addr)
+
+
+def send_chunk_nak(destination_id, destination_addr, file_id, chunk_index, reason):
+    """Tell a requester why this peer cannot serve its requested chunk."""
+    datagram = protocol_design.make_datagram(
+        packet_name="CHUNK_NAK",
+        peer_id=peer_id,
+        destination_p_id=destination_id,
+        protocol_version=protocol_design.PROTOCOL_VERSION,
+        flags=0,
+        group_id=0,
+        seq_no=0,
+        payload=(file_id, chunk_index, reason),
+    )
+    server.sendto(datagram, destination_addr)
+
+
+def send_chunk_data(destination_id, destination_addr, file_id, chunk_index):
+    """Send a chunk in 32-fragment windows and retry fragments lacking ACKs."""
+    try:
+        chunk_data = chunk_store.load_chunk(
+            CHUNK_STORE_DIR,
+            file_id,
+            chunk_index,
+        )
+    except (OSError, KeyError):
+        return
+    total_chunk_size = len(chunk_data)
+    fragments = []
     for fragment_offset in range(0, total_chunk_size, CHUNK_FRAGMENT_DATA_SIZE):
         fragment_data = chunk_data[
             fragment_offset:fragment_offset + CHUNK_FRAGMENT_DATA_SIZE
@@ -552,15 +601,54 @@ def send_chunk_data(destination_id, destination_addr, file_id, chunk_index):
             flags=0,
             group_id=0,
             seq_no=(fragment_offset // CHUNK_FRAGMENT_DATA_SIZE) & 0xFFFF,
-            payload=(
-                file_id,
-                chunk_index,
-                fragment_offset,
-                total_chunk_size,
-                fragment_data,
-            ),
+            payload=(file_id, chunk_index, fragment_offset, total_chunk_size, fragment_data),
         )
-        server.sendto(datagram, destination_addr)
+        fragments.append((fragment_offset, datagram))
+
+    transfer_key = (destination_id, file_id, chunk_index)
+    send_state = {
+        "addr": destination_addr,
+        "total_size": total_chunk_size,
+        "fragments": fragments,
+        "acked": set(),
+        "event": threading.Event(),
+    }
+    with chunk_send_lock:
+        if transfer_key in pending_chunk_sends:
+            return
+        pending_chunk_sends[transfer_key] = send_state
+
+    try:
+        fragment_count = len(fragments)
+        for window_start in range(0, fragment_count, CHUNK_SEND_WINDOW):
+            window_end = min(window_start + CHUNK_SEND_WINDOW, fragment_count)
+            window_offsets = {
+                fragments[index][0] for index in range(window_start, window_end)
+            }
+
+            for _ in range(CHUNK_FRAGMENT_RETRIES):
+                with chunk_send_lock:
+                    missing_offsets = window_offsets - send_state["acked"]
+                    send_state["event"].clear()
+                if not missing_offsets:
+                    break
+
+                for fragment_offset, datagram in fragments[window_start:window_end]:
+                    if fragment_offset in missing_offsets:
+                        server.sendto(datagram, destination_addr)
+
+                send_state["event"].wait(CHUNK_ACK_TIMEOUT)
+
+            with chunk_send_lock:
+                window_complete = window_offsets.issubset(send_state["acked"])
+            if not window_complete:
+                return
+    except OSError as error:
+        print(f"Chunk send to peer {destination_id} failed: {error}")
+    finally:
+        with chunk_send_lock:
+            if pending_chunk_sends.get(transfer_key) is send_state:
+                pending_chunk_sends.pop(transfer_key, None)
 
 
 def request_chunk(file_id, chunk_index, preferred_owner_id=None, preferred_addr=None):
@@ -1208,7 +1296,15 @@ def handle_chunk_transfer(message, addr):
     request_type = protocol_design.get_packet_type("CHUNK_REQUEST")
     data_type = protocol_design.get_packet_type("CHUNK_DATA")
     replication_type = protocol_design.get_packet_type("REPLICATE_REQ")
-    if packet_type not in (request_type, data_type, replication_type):
+    ack_type = protocol_design.get_packet_type("CHUNK_ACK")
+    nak_type = protocol_design.get_packet_type("CHUNK_NAK")
+    if packet_type not in (
+        request_type,
+        data_type,
+        replication_type,
+        ack_type,
+        nak_type,
+    ):
         return False
 
     try:
@@ -1240,13 +1336,81 @@ def handle_chunk_transfer(message, addr):
             )
             return True
 
+        if packet_type == ack_type:
+            file_id, chunk_index, cumulative_offset, bitmap = (
+                protocol_design.check_datagram(message, show_output=False)
+            )
+            transfer_key = (sender_id, file_id, chunk_index)
+            with chunk_send_lock:
+                send_state = pending_chunk_sends.get(transfer_key)
+                if send_state is None or send_state["addr"] != addr:
+                    return True
+
+                total_size = send_state["total_size"]
+                if (
+                    cumulative_offset > total_size
+                    or (
+                        cumulative_offset != total_size
+                        and cumulative_offset % CHUNK_FRAGMENT_DATA_SIZE != 0
+                    )
+                ):
+                    return True
+
+                for fragment_offset, _ in send_state["fragments"]:
+                    if fragment_offset < cumulative_offset:
+                        send_state["acked"].add(fragment_offset)
+                    elif fragment_offset >= cumulative_offset:
+                        bit_index, remainder = divmod(
+                            fragment_offset - cumulative_offset,
+                            CHUNK_FRAGMENT_DATA_SIZE,
+                        )
+                        if (
+                            remainder == 0
+                            and bit_index < CHUNK_SEND_WINDOW
+                            and bitmap & (1 << bit_index)
+                        ):
+                            send_state["acked"].add(fragment_offset)
+                send_state["event"].set()
+            return True
+
+        if packet_type == nak_type:
+            file_id, chunk_index, reason = protocol_design.check_datagram(
+                message,
+                show_output=False,
+            )
+            key = (file_id, chunk_index)
+            with chunk_download_lock:
+                state = pending_chunk_downloads.get(key)
+                if (
+                    state is not None
+                    and state["owner_id"] == sender_id
+                    and state["owner_addr"] == addr
+                ):
+                    state["error"] = (
+                        f"Peer rejected chunk request (reason {reason})"
+                    )
+                    state["event"].set()
+            return True
+
         if packet_type == request_type:
             file_id, chunk_index = protocol_design.check_datagram(
                 message,
                 show_output=False,
             )
             if chunk_store.has_chunk(CHUNK_STORE_DIR, file_id, chunk_index):
-                send_chunk_data(sender_id, addr, file_id, chunk_index)
+                threading.Thread(
+                    target=send_chunk_data,
+                    args=(sender_id, addr, file_id, chunk_index),
+                    daemon=True,
+                ).start()
+            else:
+                send_chunk_nak(
+                    sender_id,
+                    addr,
+                    file_id,
+                    chunk_index,
+                    protocol_design.CHUNK_NAK_REASONS["NOT_STORED"],
+                )
             return True
 
         file_id, chunk_index, fragment_offset, total_chunk_size, fragment_data = (
@@ -1273,12 +1437,31 @@ def handle_chunk_transfer(message, addr):
                 return True
 
             state["total_size"] = total_chunk_size
+            expected_fragment_size = min(
+                CHUNK_FRAGMENT_DATA_SIZE,
+                total_chunk_size - fragment_offset,
+            )
+            if (
+                fragment_offset % CHUNK_FRAGMENT_DATA_SIZE != 0
+                or fragment_offset >= total_chunk_size
+                or len(fragment_data) != expected_fragment_size
+            ):
+                return True
+
             prior_data = state["fragments"].get(fragment_offset)
             if prior_data is not None and prior_data != fragment_data:
                 state["error"] = "Conflicting duplicate fragment"
                 state["event"].set()
                 return True
             state["fragments"][fragment_offset] = fragment_data
+
+            send_chunk_ack(
+                sender_id,
+                addr,
+                file_id,
+                chunk_index,
+                state["fragments"],
+            )
 
             expected_offset = 0
             ordered_fragments = []

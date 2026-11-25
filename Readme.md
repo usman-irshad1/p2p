@@ -13,7 +13,7 @@ A student project to build a multi-peer group chat and file-sharing application 
 - [x] Heartbeats, peer timeout removal, and graceful LEAVE handling.
 - [x] A 20-byte application header using network byte order: `!HHBBHIHHHH`.
 - [x] Packet type IDs and payload helpers for JOIN, CHAT, CHUNK_REQUEST, LEAVE, HEARTBEAT, ACK, JOIN_ACK, CHUNK_DATA, FILE_LIST, CHUNK_HAVE, REPLICATE_REQ, and NEW_PEER.
-- [x] Added CHUNK_ACK selective-ack and CHUNK_NAK failure packet layouts and codec helpers; live handling is the next protocol step.
+- [x] CHUNK_ACK selective acknowledgements now drive 32-fragment send windows with bounded retransmission; CHUNK_NAK reports missing chunks and lets downloads try the next owner.
 - [x] Checksum and packet validation helpers, including CHAT and ACK validation.
 - [x] Local CHUNK_DATA fragmentation and reassembly demonstration: two 500-byte fragments rebuild a 1,000-byte chunk.
 - [x] Reliable ordered chat logic in `p2p_file.py`: per-peer queues, exact ACK matching, retransmission of the same CHAT after one second, duplicate suppression, and in-order acceptance.
@@ -23,12 +23,14 @@ A student project to build a multi-peer group chat and file-sharing application 
 - [x] `/index <path>` splits a file into 256 KiB chunks; with at least four peers, it assigns two distinct peers per chunk and asks remote owners to copy their assigned chunks.
 - [x] `/download <file_id_hex> [output_path]` requests chunks in parallel batches of four and verifies the rebuilt file's SHA-256.
 - [x] CHUNK_REQUEST and fragmented CHUNK_DATA transfer are connected to the live UDP message loop; each request is sent up to three times, and temporary source copies are removed after both assigned peers announce ownership.
+- [x] Live CHUNK_ACK/CHUNK_NAK handling: receivers report cumulative progress and selective fragment receipt; each 32-fragment window gets up to five send rounds, and a missing chunk triggers NOT_STORED.
 - [x] On LEAVE or heartbeat timeout, the lowest-ID surviving owner asks an unassigned peer to copy an under-replicated chunk; repair requests retry until a replacement owner is announced.
 - [x] When a peer joins, it computes its assigned share and fetches missing chunks from known owners; old replicas are retained, so this is additive rebalancing.
 - [x] Local screenshots show peers joining and receiving sequential chat messages. Evidence is collected in [the debugging PDF](evidence/p2p_debug_outputs.pdf).
 
 ### Remaining for the full assignment
 
+- [ ] Run a live transfer with packet loss to check selective fragment retry and NOT_STORED failover; save terminal screenshots as evidence.
 - [ ] Run a live four-peer check of catalog exchange, replica placement, download, and the latest Rule 6/7 chat changes; save screenshots as evidence.
 - [ ] Replace the remaining text-based membership messages with the specified binary protocol packets.
 - [ ] Prepare at least two files of 2 MB or larger; split them into fixed-size chunks.
@@ -159,7 +161,7 @@ Measured performance graphs still need real test data. Planned graphs include ch
 
 - Membership control is still text-based; the binary packet helpers are not integrated for every message type.
 - Placement currently runs when `/index` is entered, and needs at least four joined peers and at least two chunks. A file indexed before the group is ready must be indexed again after peers join.
-- A downloader tries another advertised owner after a request times out, but recovery has not been demonstrated live. CHUNK_ACK/CHUNK_NAK formats are defined, while live selective fragment ACK handling and immediate NAK failover remain unimplemented.
+- CHUNK_ACK/CHUNK_NAK are connected to the live chunk-transfer loop, but packet-loss recovery and NAK failover still need live testing. Only the NOT_STORED NAK reason is currently sent.
 - The peer list and reliability state exist only in memory.
 - The advertised `127.0.0.1` address supports same-computer testing, not communication between separate computers.
 
