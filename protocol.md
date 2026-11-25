@@ -69,6 +69,8 @@ Packet type numbers currently assigned in `protocol_design.py`:
 | 9 | CHUNK_HAVE | 32-byte file ID + `uint32 chunk_index` | Encoder/parser and live ownership update exist. |
 | 10 | REPLICATE_REQ | 32-byte file ID + `uint32 chunk_index` | Encoder/parser exist; receiver asks the sender for its assigned chunk copy. |
 | 11 | NEW_PEER | One 8-byte peer record | Encoder/parser exist; live membership still uses the text message. |
+| 12 | CHUNK_NAK | 32-byte file ID + `uint32 chunk_index` + `uint8 reason` | Codec helper exists; live chunk-transfer handler is not connected yet. |
+| 13 | CHUNK_ACK | 32-byte file ID + `uint32 chunk_index` + `uint32 cumulative_offset` + `uint32 bitmap` | Codec helper exists; live selective retransmission is not connected yet. |
 
 The registry is not complete until every type has a precise purpose, payload layout, and message flow, or is explicitly marked reserved for a later version.
 
@@ -136,6 +138,31 @@ The metadata is 44 bytes. `fragment_offset` is the byte offset within the chunk.
 
 The current live implementation sends fragments of at most 960 bytes and validates that the fragment set has no gaps or conflicting overlaps before storing the complete chunk. Chunks are kept under `peer_chunks/<file_id>/<chunk_index>.chunk`.
 
+### CHUNK_ACK (type 13) - selective chunk acknowledgement
+
+Payload:
+
+```text
+32-byte file_id
+uint32 chunk_index
+uint32 cumulative_offset
+uint32 bitmap
+```
+
+The payload is 44 bytes. Header `seq_no` and `ack_no` are both zero; the chunk identity and byte ranges are in the payload. `cumulative_offset` is the first byte offset not yet cumulatively received and is aligned to the 960-byte fragment size. Bitmap bit 0 describes the fragment beginning at `cumulative_offset`; each higher bit describes the next 960-byte fragment. A set bit means that fragment was received. Bit 31 therefore reports the 32nd fragment beginning at or after the cumulative offset. The sender may discard acknowledged fragment bytes below the cumulative offset and retransmit only fragments whose bitmap bit is clear. CHUNK_ACK is not itself acknowledged. This message layout is defined and encoded/decoded by `protocol_design.py`, but the live transfer loop does not yet send or process it.
+
+### CHUNK_NAK (type 12) - chunk request failure
+
+Payload:
+
+```text
+32-byte file_id
+uint32 chunk_index
+uint8 reason
+```
+
+Reason codes are `1 = NOT_STORED`, `2 = BUSY`, and `3 = HASH_MISMATCH`. Header `seq_no` and `ack_no` are zero. It tells the requester to fail over immediately to another known owner. CHUNK_NAK is not retransmitted; the requester can retry with another owner. The codec is defined, but the live transfer loop does not yet send or process it.
+
 ### NEW_PEER (type 11) - proposed
 
 Proposed payload: one peer record, using the same 8-byte record as JOIN_ACK:
@@ -180,6 +207,8 @@ Proposed exact-ACK behavior for version 1:
 
 Still to specify: initial sequence numbers, wraparound behavior, retry timeout/count, which packet types require ACKs, maximum outstanding packets, and what happens when retries are exhausted. Header sequence numbers wrap in the 16-bit range; sequence comparison rules must account for that.
 
+For chunk transfer, CHUNK_ACK is a separate selective acknowledgement keyed by `(file_id, chunk_index)`. Its cumulative offset and 32-bit fragment bitmap report received byte ranges; it does not use the header's exact `ack_no`. A sender keeps at most 32 fragments outstanding for a chunk and resends only reported gaps after a timeout or later ACK progress. This window behavior is a protocol target and is not yet implemented in `p2p_file.py`.
+
 ## 6. Message flows
 
 Membership currently uses text messages. Chat and file exchange use the binary protocol messages described here.
@@ -214,7 +243,7 @@ After a graceful LEAVE or heartbeat timeout, each peer removes the departed owne
 
 When a peer joins, it uses the current peer IDs and balanced placement algorithm to find chunks assigned to it. As existing owners send `FILE_LIST` and `CHUNK_HAVE`, the joining peer requests each missing assigned chunk with `CHUNK_REQUEST`, stores the data, and announces ownership with `CHUNK_HAVE`.
 
-Limitations: initial placement runs only when `/index` is issued and needs four peers and at least two chunks. Join rebalancing adds the joining peer's assigned copies but does not delete older replicas, so extra copies can remain. Automatic repair and join rebalancing are implemented but still need live multi-peer verification. Fragment-level ACKs and safe removal of surplus replicas remain unimplemented.
+Limitations: initial placement runs only when `/index` is issued and needs four peers and at least two chunks. Join rebalancing adds the joining peer's assigned copies but does not delete older replicas, so extra copies can remain. Automatic repair and join rebalancing are implemented but still need live multi-peer verification. CHUNK_ACK/CHUNK_NAK codecs are specified, but fragment-level retransmission, live NAK handling, and safe removal of surplus replicas remain unimplemented.
 
 ## 7. Current implementation inventory
 

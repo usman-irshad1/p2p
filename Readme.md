@@ -13,6 +13,7 @@ A student project to build a multi-peer group chat and file-sharing application 
 - [x] Heartbeats, peer timeout removal, and graceful LEAVE handling.
 - [x] A 20-byte application header using network byte order: `!HHBBHIHHHH`.
 - [x] Packet type IDs and payload helpers for JOIN, CHAT, CHUNK_REQUEST, LEAVE, HEARTBEAT, ACK, JOIN_ACK, CHUNK_DATA, FILE_LIST, CHUNK_HAVE, REPLICATE_REQ, and NEW_PEER.
+- [x] Added CHUNK_ACK selective-ack and CHUNK_NAK failure packet layouts and codec helpers; live handling is the next protocol step.
 - [x] Checksum and packet validation helpers, including CHAT and ACK validation.
 - [x] Local CHUNK_DATA fragmentation and reassembly demonstration: two 500-byte fragments rebuild a 1,000-byte chunk.
 - [x] Reliable ordered chat logic in `p2p_file.py`: per-peer queues, exact ACK matching, retransmission of the same CHAT after one second, duplicate suppression, and in-order acceptance.
@@ -158,7 +159,7 @@ Measured performance graphs still need real test data. Planned graphs include ch
 
 - Membership control is still text-based; the binary packet helpers are not integrated for every message type.
 - Placement currently runs when `/index` is entered, and needs at least four joined peers and at least two chunks. A file indexed before the group is ready must be indexed again after peers join.
-- A downloader tries another advertised owner after a request times out, but recovery has not been demonstrated live. Re-replication after peer loss, automatic rebalancing for later arrivals, and file-fragment ACKs remain unimplemented.
+- A downloader tries another advertised owner after a request times out, but recovery has not been demonstrated live. CHUNK_ACK/CHUNK_NAK formats are defined, while live selective fragment ACK handling and immediate NAK failover remain unimplemented.
 - The peer list and reliability state exist only in memory.
 - The advertised `127.0.0.1` address supports same-computer testing, not communication between separate computers.
 
