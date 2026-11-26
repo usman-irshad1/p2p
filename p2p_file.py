@@ -1917,7 +1917,7 @@ def chat_sender_once():
                     payload=(session_id, chat_sequence, text),
                 )
                 pending_by_sequence[packet_sequence] = {
-                        "seq_no": packet_sequence,
+                    "seq_no": packet_sequence,
                     "datagram": datagram_to_send,
                     "addr": destination_addr,
                     "sent_at": now,
@@ -2369,8 +2369,10 @@ def handle_protocol_chat_or_ack(message, addr):
         return False
 
     packet_type = message[4]
-    if packet_type not in (protocol_design.get_packet_type("CHAT"),
-                           protocol_design.get_packet_type("ACK")):
+    if packet_type not in (
+        protocol_design.get_packet_type("CHAT"),
+        protocol_design.get_packet_type("ACK"),
+    ):
         return False
 
     try:
