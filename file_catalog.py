@@ -140,14 +140,15 @@ def merge_file_list(catalog, file_records):
 
 def file_list_records(catalog):
     """Return sorted metadata records ready for a FILE_LIST payload."""
-    records = []
-    for file_id, metadata in catalog.items():
-        records.append((
+    records = [
+        (
             file_id,
             metadata["file_size"],
             metadata["chunk_size"],
             metadata["filename"],
-        ))
+        )
+        for file_id, metadata in catalog.items()
+    ]
     return tuple(sorted(records, key=lambda record: record[0]))
 
 
