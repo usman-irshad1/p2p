@@ -69,14 +69,10 @@ def split_and_store_file(source_path, storage_dir, file_id, chunk_size):
 
     chunk_indices = []
     with open(source_path, "rb") as source_file:
-        chunk_index = 0
-        while True:
-            chunk_data = source_file.read(chunk_size)
-            if not chunk_data:
-                break
+        chunks = iter(lambda: source_file.read(chunk_size), b"")
+        for chunk_index, chunk_data in enumerate(chunks):
             store_chunk(storage_dir, file_id, chunk_index, chunk_data)
             chunk_indices.append(chunk_index)
-            chunk_index += 1
 
     return tuple(chunk_indices)
 
