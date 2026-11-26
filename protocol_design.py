@@ -1312,7 +1312,7 @@ def main():
 
     print("CHAT payload and size tests passed.")
 
-        # Test CHUNK_DATA fragmentation and reassembly.
+    # Test CHUNK_DATA fragmentation and reassembly.
     print("\nTesting CHUNK_DATA reassembly:")
 
     file_id = b"\x01" * 32
