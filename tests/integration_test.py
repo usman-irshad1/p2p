@@ -395,8 +395,10 @@ def main():
             )
             downloader.wait_for(r"Downloaded and verified file", 60, corrupt_download_start)
             with open(os.path.join(work_dir, "corrupt-fallback.bin"), "rb") as handle:
-                check(hashlib.sha256(handle.read()).hexdigest() == corrupt_file_hex,
-                      "corrupt replica was rejected and a valid replica rebuilt the file")
+                check(
+                    hashlib.sha256(handle.read()).hexdigest() == corrupt_file_hex,
+                    "corrupt replica was rejected and a valid replica rebuilt the file",
+                )
         finally:
             with open(corrupt_path, "wb") as handle:
                 handle.write(original_chunk)
